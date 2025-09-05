@@ -115,8 +115,9 @@ CREATE TABLE amendments -- 개정문
 );
 
 CREATE TABLE ministries(  -- 소관 부처
-    ministryId      BIGSERIAL PRIMARY KEY ,     -- 소관부처코드
-    ministryName  VARCHAR(50)
+    ministryId      BIGSERIAL PRIMARY KEY ,     -- 소관부처 저장번호
+    ministryName    VARCHAR(50),    -- 소관부처 이름
+    ministryCode    VARCHAR(50)     -- 소관부처 코드
 );
 
 CREATE TABLE departmentUnit --부서단위
