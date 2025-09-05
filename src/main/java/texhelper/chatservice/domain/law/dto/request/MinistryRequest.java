@@ -1,6 +1,8 @@
 package texhelper.chatservice.domain.law.dto.request;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import jakarta.persistence.CascadeType;
+import jakarta.persistence.OneToMany;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -13,14 +15,12 @@ import java.util.List;
 @Getter
 @NoArgsConstructor
 @AllArgsConstructor
-public class MinistriesRequest {
+public class MinistryRequest {
 
-    @JsonProperty("소관부처명")
+    @JsonProperty("content")
     private String ministryName;
 
-    private List<DepartmentUnit> departmentUnit =  new ArrayList<>();
+    @JsonProperty("소관부처코드")
+    private String ministryCode;
 
-    public Ministry toEntity(){
-        return new Ministry();
-    }
 }

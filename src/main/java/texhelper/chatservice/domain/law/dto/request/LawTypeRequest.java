@@ -11,7 +11,7 @@ import texhelper.chatservice.domain.law.entity.LawType;
 @AllArgsConstructor
 public class LawTypeRequest {
 
-    @JsonProperty("법종구분")
+    @JsonProperty("content")
     private String lawType;
 
     @JsonProperty("법종구분코드")

@@ -44,8 +44,6 @@ public class Amendments {
                 .build();
         law.getAmendments().add(amendment);
 
-        law.getAmendments().add(amendment);
-
         return amendment;
     }
 }

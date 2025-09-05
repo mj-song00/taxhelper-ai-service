@@ -4,13 +4,11 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
-import texhelper.chatservice.domain.law.entity.DepartmentUnit;
 
 @Getter
 @NoArgsConstructor
 @AllArgsConstructor
 public class DepartmentUnitRequest {
-
 
     @JsonProperty("부서명")
     private String deptName;
@@ -18,7 +16,13 @@ public class DepartmentUnitRequest {
     @JsonProperty("부서연락처")
     private String deptPhone;
 
-    public DepartmentUnit toEntity(){
-        return new DepartmentUnit();
-    }
+    @JsonProperty("부서키")
+    private String deptKey;
+
+    @JsonProperty("소관부처명")
+    private String ministryName;
+
+    @JsonProperty("소관부처코드")
+    private String ministryCode;
+
 }

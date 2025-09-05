@@ -20,14 +20,14 @@ public class SubItemRequest {
 
     @JsonProperty("목내용")
     @JsonDeserialize(using = StringOrArrayDeserializer.class)
-    private List<String> content;
+    private List<String>  subContent;
 
     public SubItem toEntity() {
         return SubItem.builder()
                 .subItemNo(subNo)
-                . subContent(content != null
-                ? String.join("\n", content)  // 엔티티가 String이면 join
-                : null)
+                .subContent(subContent != null
+                        ? String.join("\n", subContent)   // 엔티티가 String이면 join
+                        : null)
                 .build();
     }
 }

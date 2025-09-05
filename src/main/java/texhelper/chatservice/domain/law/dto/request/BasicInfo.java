@@ -68,4 +68,13 @@ public class BasicInfo {
 
     @JsonProperty("편장절관")
     private String structureCode;
+
+    @JsonProperty("소관부처")
+    private MinistryRequest 소관부처;
+
+    @JsonProperty("법종구분")
+    private LawTypeRequest 법종구분;
+
+    @JsonProperty("연락부서")
+    private ContactDepartment contactDepartment;
 }
