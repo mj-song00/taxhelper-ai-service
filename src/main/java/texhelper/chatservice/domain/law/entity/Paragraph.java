@@ -50,6 +50,7 @@ public class Paragraph extends Timestamped {
     }
 
     public Paragraph addItem(Item i){
+        if (this.item == null) this.item = new ArrayList<>();
         this.item.add(i);
         i.assignItem(this);
         return this;

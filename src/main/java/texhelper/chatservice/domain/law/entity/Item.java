@@ -39,8 +39,16 @@ public class Item extends Timestamped {
     @JoinColumn(name = "paragraphId", nullable = false)
     private  Paragraph paragraph;
 
+
     public void assignItem(Paragraph paragraph){
         this.paragraph = paragraph;
+    }
+
+    public Item addSubItem(SubItem s){
+        if (this.subItem == null) this.subItem = new ArrayList<>();
+        this.subItem.add(s);
+        s.assignItem(this);
+        return this;
     }
 
 }

@@ -95,10 +95,18 @@ public class Law extends Timestamped {
     @OneToMany(mappedBy = "law", cascade = CascadeType.ALL, orphanRemoval = true)
     private List<Amendments> amendments =  new ArrayList<>();
 
+    @OneToMany(mappedBy = "law", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<Ministry> ministry = new ArrayList<>();
+
+    @OneToMany(mappedBy = "law", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<LawType> lawTypes = new ArrayList<>();
+
     public Law(Long id, Long lawId, Long lawKey, String nameKor, String nameHanja, String nameShort, String decisionType,
                String proposalType, String proclamationNo, String proclamationDate, String enforcementDate,
                String phoneNumber, String language, String revisionType, String joinMinistry,
-               String isProclaimed, String isKorean, String isTitleChange, String hasAnnex, String structureCode, List<Articles> articles, List<Supplements> supplements, List<Amendments> amendments) {
+               String isProclaimed, String isKorean, String isTitleChange, String hasAnnex, String structureCode,
+               List<Articles> articles, List<Supplements> supplements, List<Amendments> amendments,
+               List<Ministry> ministry,  List<LawType> lawTypes) {
         this.id = id;
         this.lawId =  lawId;
         this.lawKey = lawKey;
@@ -122,5 +130,20 @@ public class Law extends Timestamped {
         this.articles = articles;
         this.supplements = supplements;
         this.amendments = amendments;
+        this.ministry = ministry;
+        this.lawTypes = lawTypes;
+    }
+
+    public void initMinistryList() {
+        if (this.ministry == null) this.ministry = new ArrayList<>();
+    }
+
+    public void  addLawType (LawType l){
+        if(this.lawTypes == null){
+            this.lawTypes = new ArrayList<>();
+        }
+
+        this.lawTypes.add(l);
+        l.assignLawType(this);
     }
 }

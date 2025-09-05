@@ -5,6 +5,7 @@ import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
+import texhelper.chatservice.common.entity.Timestamped;
 
 @Getter
 @Entity
@@ -16,7 +17,7 @@ import lombok.NoArgsConstructor;
      *   https://open.law.go.kr/LSO/openApi/guideResult.do
      *   호에 속한 목을 subItem으로 분리하에 테이블을 만들었습니다.
      */
-public class SubItem {
+public class SubItem extends Timestamped {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     @Column
@@ -31,4 +32,8 @@ public class SubItem {
     @ManyToOne
     @JoinColumn(name = "itemId", nullable = false)
     private Item item;
+
+    public void assignItem(Item item) {
+        this.item = item;
+    }
 }
