@@ -37,8 +37,4 @@ public class RestClientConfig {
             throw new RuntimeException("JSON 매핑 실패", e);
         }
     }
-
-
-
-
 }
