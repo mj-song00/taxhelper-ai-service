@@ -11,10 +11,6 @@ import lombok.NoArgsConstructor;
 @AllArgsConstructor
 @NoArgsConstructor
 public class PrecedentDetail {
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    @Column
-    private Long id; //자동저장 id
 
     @Column
     private String judgment; //판시사항
@@ -47,6 +43,7 @@ public class PrecedentDetail {
     private String caseCode; // 사건 종류 코드
 
     @Column
+    @Id
     private String precedentNo; //판례번호
 
     @Column
