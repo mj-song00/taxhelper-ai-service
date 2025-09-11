@@ -13,6 +13,10 @@ import texhelper.chatservice.common.entity.Timestamped;
 @NoArgsConstructor
 public class PrecedentSummary extends Timestamped {
 
+    @Id
+    @Column (name = "판례일련번호", nullable = false, updatable = false)
+    private String precedentNo; // 판례 일련번호
+
     @Column(nullable= false)
     private String caseNo; //사건번호
 
@@ -33,10 +37,6 @@ public class PrecedentSummary extends Timestamped {
 
     @Column
     private String courtName; // 법원명
-
-    @Id
-    @Column (nullable= false)
-    private String precedentNo; // 판례 일련번호
 
     @Column
     private String judgmentType; // 판결유형

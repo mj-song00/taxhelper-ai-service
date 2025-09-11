@@ -13,6 +13,10 @@ import lombok.NoArgsConstructor;
 public class PrecedentDetail {
 
     @Column
+    @Id
+    private String precedentNo; //판례번호
+
+    @Column
     private String judgment; //판시사항
 
     @Column
@@ -42,9 +46,6 @@ public class PrecedentDetail {
     @Column
     private String caseCode; // 사건 종류 코드
 
-    @Column
-    @Id
-    private String precedentNo; //판례번호
 
     @Column
     private String sentencing; //선고
