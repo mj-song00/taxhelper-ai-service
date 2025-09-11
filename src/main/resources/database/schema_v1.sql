@@ -1,17 +1,7 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
-DROP TABLE IF EXISTS users;
-DROP TABLE IF EXISTS laws;
-DROP TABLE IF EXISTS articles;
-DROP TABLE IF EXISTS paragraph;
-DROP TABLE IF EXISTS item;
-DROP TABLE IF EXISTS subItem;
-DROP TABLE IF EXISTS supplements;
-DROP TABLE IF EXISTS amendments;
-DROP TABLE IF EXISTS ministries;
-DROP TABLE IF EXISTS departmentUnit;
-DROP TABLE IF EXISTS law_types;
-
+DROP DATABASE IF EXISTS texHelper;
+CREATE DATABASE taxHelper;
 
 CREATE TABLE users
 (
@@ -134,3 +124,132 @@ CREATE TABLE law_types -- 법종 구분
     lawType         VARCHAR(50),              -- "법률", "시행령" 등 법종 구문
     lawTypeCode    VARCHAR(20)                -- "A0002" 등 코드
 );
+
+-- Spring Batch 테이블
+CREATE TABLE BATCH_JOB_INSTANCE
+(
+    job_instance_id BIGINT       NOT NULL PRIMARY KEY,
+    version         BIGINT,
+    job_name        VARCHAR(100) NOT NULL,
+    job_key         VARCHAR(32)  NOT NULL,
+    UNIQUE KEY uk_job_name_key (job_name, job_key)
+);
+
+CREATE TABLE BATCH_JOB_EXECUTION
+(
+    job_execution_id BIGINT      NOT NULL PRIMARY KEY,
+    version          BIGINT,
+    job_instance_id  BIGINT      NOT NULL,
+    create_time      DATETIME(6) NOT NULL,
+    start_time       DATETIME(6),
+    end_time         DATETIME(6),
+    status           VARCHAR(10),
+    exit_code        VARCHAR(2500),
+    exit_message     VARCHAR(2500),
+    last_updated     DATETIME(6),
+    FOREIGN KEY (job_instance_id) REFERENCES BATCH_JOB_INSTANCE (job_instance_id)
+);
+
+CREATE TABLE BATCH_JOB_EXECUTION_PARAMS
+(
+    job_execution_id BIGINT       NOT NULL,
+    parameter_name   VARCHAR(100) NOT NULL,
+    parameter_type   VARCHAR(100) NOT NULL,
+    parameter_value  VARCHAR(2500),
+    identifying      CHAR(1)      NOT NULL,
+    FOREIGN KEY (job_execution_id) REFERENCES BATCH_JOB_EXECUTION (job_execution_id)
+) ENGINE = InnoDB;
+
+CREATE TABLE BATCH_STEP_EXECUTION
+(
+    step_execution_id  BIGINT       NOT NULL PRIMARY KEY,
+    version            BIGINT       NOT NULL,
+    step_name          VARCHAR(100) NOT NULL,
+    job_execution_id   BIGINT       NOT NULL,
+    create_time        DATETIME(6)  NOT NULL,
+    start_time         DATETIME(6),
+    end_time           DATETIME(6),
+    status             VARCHAR(10),
+    commit_count       BIGINT,
+    read_count         BIGINT,
+    filter_count       BIGINT,
+    write_count        BIGINT,
+    read_skip_count    BIGINT,
+    write_skip_count   BIGINT,
+    process_skip_count BIGINT,
+    rollback_count     BIGINT,
+    exit_code          VARCHAR(2500),
+    exit_message       VARCHAR(2500),
+    last_updated       DATETIME(6),
+    FOREIGN KEY (job_execution_id) REFERENCES BATCH_JOB_EXECUTION (job_execution_id)
+);
+
+CREATE TABLE BATCH_STEP_EXECUTION_CONTEXT
+(
+    step_execution_id  BIGINT        NOT NULL PRIMARY KEY,
+    short_context      VARCHAR(2500) NOT NULL,
+    serialized_context TEXT,
+    FOREIGN KEY (step_execution_id) REFERENCES BATCH_JOB_EXECUTION (job_execution_id)
+);
+
+CREATE TABLE BATCH_JOB_EXECUTION_CONTEXT
+(
+    job_execution_id   BIGINT        NOT NULL PRIMARY KEY,
+    short_context      VARCHAR(2500) NOT NULL,
+    serialized_context TEXT,
+    FOREIGN KEY (job_execution_id) REFERENCES BATCH_JOB_EXECUTION (job_execution_id)
+);
+
+-- 커스텀 배치 테이블
+CREATE TABLE BATCH_LOCK
+(
+    id        BIGINT       NOT NULL,
+    job_name  VARCHAR(255) NOT NULL,
+    locked_at DATETIME(6)  NOT NULL,
+    locked_by VARCHAR(255) NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_job_name (job_name)
+);
+
+CREATE TABLE BATCH_JOB_REQUEST
+(
+    id           BIGINT       NOT NULL,
+    job_name     VARCHAR(255) NOT NULL,
+    job_param    VARCHAR(255),
+    requested_at DATETIME(6)  NOT NULL,
+    PRIMARY KEY (id)
+);
+
+-- 시퀀스 테이블
+CREATE TABLE BATCH_STEP_EXECUTION_SEQ
+(
+    id         BIGINT  NOT NULL,
+    unique_key CHAR(1) NOT NULL,
+    UNIQUE KEY uk_batch_step_seq (unique_key)
+);
+
+INSERT INTO BATCH_STEP_EXECUTION_SEQ (id, unique_key)
+VALUES (0, '0')
+ON DUPLICATE KEY UPDATE id = id;
+
+CREATE TABLE BATCH_JOB_EXECUTION_SEQ
+(
+    id         BIGINT  NOT NULL,
+    unique_key CHAR(1) NOT NULL,
+    UNIQUE KEY uk_batch_job_exec_seq (unique_key)
+);
+
+INSERT INTO BATCH_JOB_EXECUTION_SEQ (id, unique_key)
+VALUES (0, '0')
+ON DUPLICATE KEY UPDATE id = id;
+
+CREATE TABLE BATCH_JOB_SEQ
+(
+    id         BIGINT  NOT NULL,
+    unique_key CHAR(1) NOT NULL,
+    UNIQUE KEY uk_batch_job_seq (unique_key)
+);
+
+INSERT INTO BATCH_JOB_SEQ (id, unique_key)
+VALUES (0, '0')
+ON DUPLICATE KEY UPDATE id = id;
