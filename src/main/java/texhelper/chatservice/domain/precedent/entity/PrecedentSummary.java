@@ -14,7 +14,7 @@ import texhelper.chatservice.common.entity.Timestamped;
 public class PrecedentSummary extends Timestamped {
 
     @Id
-    @Column (name = "판례일련번호", nullable = false, updatable = false)
+    @Column (name = "precedent_no", nullable = false, updatable = false)
     private String precedentNo; // 판례 일련번호
 
     @Column(nullable= false)
@@ -27,7 +27,7 @@ public class PrecedentSummary extends Timestamped {
     private String caseTypeCode; //사건 종류 코드
 
     @Column
-    private String  caseTypeName; //사건종류명
+    private String caseTypeName; //사건종류명
 
     @Column
     private String sentencing; //선고
