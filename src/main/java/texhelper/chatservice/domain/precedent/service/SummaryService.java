@@ -9,8 +9,6 @@ import texhelper.chatservice.domain.precedent.dto.request.SummaryShell;
 import texhelper.chatservice.domain.precedent.entity.PrecedentSummary;
 import texhelper.chatservice.domain.precedent.repository.PrecedentSummaryRepository;
 
-import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
