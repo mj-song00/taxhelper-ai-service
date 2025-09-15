@@ -9,7 +9,11 @@ import texhelper.chatservice.domain.precedent.dto.request.SummaryShell;
 import texhelper.chatservice.domain.precedent.entity.PrecedentSummary;
 import texhelper.chatservice.domain.precedent.repository.PrecedentSummaryRepository;
 
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 @Service
 @Slf4j
@@ -35,7 +39,6 @@ public class SummaryService {
         }
     }
 
-
     public void fetchAndSaveSummaries(String keywords) {
 
         SummaryShell request = webClient.get()
@@ -50,20 +53,10 @@ public class SummaryService {
                 .bodyToMono(SummaryShell.class)
                 .block();
 
-
-        log.info("prec list: {}", request.getPrecSearch().getPrec());
-
-        /**
-         * todo summaries 가 null임 수정
-         */
         if (request != null && request.getPrecSearch() != null) {
-            List<SummaryDetailRequest> summaries = request.getPrecSearch().getPrec();
-            log.info("Fetched {} summaries", summaries != null ? summaries.size() : 0);
-
-
-            if (summaries != null) {
-                summaries.forEach(e -> log.info("Saving precedentNo: {}", e.getPrecedentNo()));
-            }
+            List<SummaryDetailRequest> summaries =
+                    Optional.ofNullable(request.getPrecSearch().getPrec())
+                            .orElse(Collections.emptyList());
 
             List<PrecedentSummary> entities = summaries.stream()
                     .filter(dto -> dto.getPrecedentNo() != null && !dto.getPrecedentNo().isBlank())
@@ -81,7 +74,6 @@ public class SummaryService {
                     ))
                     .toList();
 
-            entities.forEach(e -> log.info("Saving precedentNo: {}", e.getPrecedentNo()));
             precedentSummaryRepository.saveAll(entities);
         }
     }
