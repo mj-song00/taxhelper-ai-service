@@ -43,7 +43,7 @@ public class SummaryService {
         int page = 1;
         int totalPages = Integer.MAX_VALUE;
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy.MM.dd");
-        LocalDate fiveYearsAgo = LocalDate.now().minusYears(10);
+        LocalDate tenYearsAgo = LocalDate.now().minusYears(10);
 
         while (page <= totalPages) {
             SummaryShell request = webClient.get()
@@ -92,7 +92,7 @@ public class SummaryService {
                                 }
                                 String rawDate = dto.getSentencingDate().trim();
                                 LocalDate decisionDate = LocalDate.parse(rawDate, formatter);
-                                boolean recent = !decisionDate.isBefore(fiveYearsAgo);
+                                boolean recent = !decisionDate.isBefore(tenYearsAgo);
                                 if (!recent) log.info("제외 - 10년 초과: {} ({})", dto.getPrecedentNo(), rawDate);
                                 return recent;
                             } catch (Exception e) {
