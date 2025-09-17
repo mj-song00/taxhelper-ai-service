@@ -1,4 +1,4 @@
-package taxhelper.chatservice.domain.precedent.entity;
+package taxhelper.chatservice.domain.precedent.detail.entity;
 
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
@@ -17,13 +17,13 @@ public class PrecedentDetail {
     private String precedentNo; //판례번호
 
     @Column
-    private String judgment; //판시사항
+    private String decision; //판시사항
 
     @Column
     private String referencePrecedent; //참조 판례
 
     @Column
-    private String typeOfIncident; // 사건 종류
+    private String castTypeName; // 사건 종류
 
     @Column
     private String summaryOfJudgment; // 판결 요지
@@ -38,7 +38,7 @@ public class PrecedentDetail {
     private String  caseName; //사건명
 
     @Column
-    private String detailsOfPrecedent; // 판례내용
+    private String precedentDetails; // 판례내용
 
     @Column
     private String caseNo; //사건번호
