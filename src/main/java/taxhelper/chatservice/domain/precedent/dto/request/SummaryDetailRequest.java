@@ -4,6 +4,9 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Getter;
 import lombok.Setter;
 
+/**
+ * todo setter는 testcode용으로만 사용합니다.
+ */
 @Getter
 @Setter
 public class SummaryDetailRequest {

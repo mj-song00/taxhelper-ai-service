@@ -6,7 +6,9 @@ import lombok.Getter;
 import lombok.Setter;
 
 import java.util.List;
-
+/**
+ * todo setter는 testcode용으로만 사용합니다.
+ */
 @Getter
 @Setter
 @JsonIgnoreProperties(ignoreUnknown = true)
