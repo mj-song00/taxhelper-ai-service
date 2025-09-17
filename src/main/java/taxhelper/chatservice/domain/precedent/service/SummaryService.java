@@ -30,8 +30,7 @@ public class SummaryService {
     private final PrecedentProperties precedentProperties;
 
     @Value("${law.api.email}")
-    String email;
-
+    private String email;
 
     public void fetchAllKeywords() {
         for (String keywords : precedentProperties.getKeywords()) {
@@ -49,7 +48,7 @@ public class SummaryService {
             SummaryShell request = webClient.get()
                     .uri(uriBuilder -> uriBuilder
                             .path("/lawSearch.do")
-                            .queryParam("OC", email)
+                            .queryParam("OC",  email)
                             .queryParam("target", "prec")
                             .queryParam("type", "JSON")
                             .queryParam("query", keywords)

@@ -2,6 +2,7 @@ package taxhelper.chatservice.domain.precedent.detail.entity;
 
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 
@@ -10,6 +11,7 @@ import lombok.NoArgsConstructor;
 @Getter
 @AllArgsConstructor
 @NoArgsConstructor
+@Builder
 public class PrecedentDetail {
 
     @Column
@@ -23,7 +25,7 @@ public class PrecedentDetail {
     private String referencePrecedent; //참조 판례
 
     @Column
-    private String castTypeName; // 사건 종류
+    private String caseTypeName; // 사건 종류
 
     @Column
     private String summaryOfJudgment; // 판결 요지

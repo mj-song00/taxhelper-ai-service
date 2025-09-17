@@ -41,14 +41,14 @@ public class SummaryServiceTest {
 
     @BeforeEach
     void setup() {
-        // 1️⃣ 키워드 리스트
+        // 키워드 리스트
         List<String> keywords = List.of(
                 "국세", "부가세", "법인세", "소득세", "증권거래세",
                 "상속세", "증여세", "주세", "관세", "지방세",
                 "취득세", "재산세", "등록세"
         );
 
-        // 2️⃣ 키워드별 더미 객체 생성
+        // 키워드별 더미 객체 생성
         dummyMap = new LinkedHashMap<>();
         for (String keyword : keywords) {
             SummaryDetailRequest detail = new SummaryDetailRequest();
@@ -66,7 +66,7 @@ public class SummaryServiceTest {
             dummyMap.put(keyword, shell);
         }
 
-        // 3️⃣ ExchangeFunction Mock
+        // ExchangeFunction Mock
         ExchangeFunction exchangeFunction = mock(ExchangeFunction.class);
         Iterator<SummaryShell> dummyIterator = dummyMap.values().iterator();
 
@@ -84,7 +84,7 @@ public class SummaryServiceTest {
                     return Mono.just(response);
                 });
 
-        // 4️⃣ 테스트용 WebClient 생성
+        // 테스트용 WebClient 생성
         webClient = WebClient.builder()
                 .exchangeFunction(exchangeFunction)
                 .build();
@@ -92,10 +92,10 @@ public class SummaryServiceTest {
         // summaryService에 webClient 주입
         summaryService = new SummaryService(webClient, precedentSummaryRepository, precedentProperties);
 
-        // 5️⃣ Properties Mock
+        // Properties Mock
         when(precedentProperties.getKeywords()).thenReturn(keywords);
 
-        // 6️⃣ Repository saveAll Mock
+        // Repository saveAll Mock
         when(precedentSummaryRepository.saveAll(anyList())).thenAnswer(invocation -> invocation.getArgument(0));
     }
 
