@@ -2,8 +2,10 @@ package taxhelper.chatservice.domain.precedent.dto.request;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Getter;
+import lombok.Setter;
 
 @Getter
+@Setter
 public class SummaryDetailRequest {
 
     @JsonProperty("사건번호")
