@@ -1,10 +1,7 @@
 package taxhelper.chatservice.domain.precedent.detail.entity;
 
 import jakarta.persistence.*;
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Getter;
-import lombok.NoArgsConstructor;
+import lombok.*;
 
 @Entity
 @Table(name = "precedentDetail")

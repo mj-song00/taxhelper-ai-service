@@ -1,13 +1,13 @@
 package taxhelper.chatservice.domain.precedent.detail.dto;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
-import lombok.AllArgsConstructor;
-import lombok.Getter;
-import lombok.NoArgsConstructor;
+import lombok.*;
 
 @Getter
 @NoArgsConstructor
 @AllArgsConstructor
+@Builder
+@Setter
 public class DetailServiceRequest {
 
     @JsonProperty("판시사항")
@@ -20,7 +20,7 @@ public class DetailServiceRequest {
     private String castTypeName; //사건종류명
 
     @JsonProperty("판결요지")
-    private String SummaryOfJudgment; //판결요지
+    private String summaryOfJudgment; //판결요지
 
     @JsonProperty("참조조문")
     private String referenceClause; //참조조문
