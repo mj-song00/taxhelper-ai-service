@@ -19,16 +19,23 @@ public class PrecedentDetail {
     private String precedentNo; //판례번호
 
     @Column
+    @Lob
     private String decision; //판시사항
 
     @Column
+    @Lob
     private String referencePrecedent; //참조 판례
 
     @Column
     private String caseTypeName; // 사건 종류
 
     @Column
+    @Lob
     private String summaryOfJudgment; // 판결 요지
+
+    @Column
+    @Lob
+    private String referenceClause; //참조조문
 
     @Column
     private String sentencingDate; // 선고일자
@@ -37,9 +44,11 @@ public class PrecedentDetail {
     private String courtName; // 법원명
 
     @Column
+    @Lob
     private String  caseName; //사건명
 
     @Column
+    @Lob
     private String precedentDetails; // 판례내용
 
     @Column
@@ -47,7 +56,6 @@ public class PrecedentDetail {
 
     @Column
     private String caseCode; // 사건 종류 코드
-
 
     @Column
     private String sentencing; //선고
