@@ -35,3 +35,8 @@ out/
 
 ### VS Code ###
 .vscode/
+
+### fast api ### 
+bin
+include
+lib
