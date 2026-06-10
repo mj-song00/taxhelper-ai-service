@@ -502,3 +502,5 @@ class ChunkSearchService:
             score=item.get("score"),
             metadata=item.get("metadata") or {},
         )
+
+        

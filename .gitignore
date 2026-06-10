@@ -40,3 +40,8 @@ out/
 bin
 include
 lib
+__pycache__/
+*.pyc
+
+### env ###
+.env

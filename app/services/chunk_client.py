@@ -15,19 +15,29 @@ class ChunkSearchClient:
         self,
         candidate_page: int,
         candidate_size: int,
-        law_names: list[str],
         keywords: list[str],
         rewritten_query: str,
+        *,
+        chunks_path: str | None = None,
+        law_names: list[str] | None = None,
+        court_names: list[str] | None = None,
+        case_numbers: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        url = f"{self.base_url}{self.chunks_path}"
-        params = {
+        url = f"{self.base_url}{chunks_path or self.chunks_path}"
+        print(f"request url = {url}")
+        params: dict[str, Any] = {
             "page": candidate_page,
             "size": candidate_size,
-            "lawNames": law_names,
             "keywords": keywords,
             "query": rewritten_query,
             "sort": "relevance,desc",
         }
+        if law_names:
+            params["lawNames"] = law_names
+        if court_names:
+            params["courtNames"] = court_names
+        if case_numbers:
+            params["caseNumbers"] = case_numbers
         async with httpx.AsyncClient(timeout=self.timeout_sec) as client:
             response = await client.get(url, params=params)
             response.raise_for_status()
@@ -71,7 +81,7 @@ class ChunkSearchClient:
         source = wrapped if isinstance(wrapped, dict) else {}
 
         zero_based_page = source.get("number")
-        one_based_page = source.get("page")
+        one_based_page = source.get("page") or source.get("currentPage")
 
         page_value = requested_page
         if isinstance(one_based_page, int):
@@ -79,11 +89,16 @@ class ChunkSearchClient:
         elif isinstance(zero_based_page, int):
             page_value = zero_based_page + 1
 
+        total_pages = source.get("totalPages") or source.get("total_pages")
+        has_next = source.get("hasNext") or source.get("has_next")
+        if has_next is None and isinstance(total_pages, int) and isinstance(page_value, int):
+            has_next = page_value < total_pages
+
         return {
             "page": page_value,
             "size": int(source.get("size", requested_size)),
             "total_elements": source.get("totalElements") or source.get("total_elements"),
-            "total_pages": source.get("totalPages") or source.get("total_pages"),
-            "has_next": source.get("hasNext") or source.get("has_next"),
+            "total_pages": total_pages,
+            "has_next": has_next,
             "has_previous": source.get("hasPrevious") or source.get("has_previous"),
         }

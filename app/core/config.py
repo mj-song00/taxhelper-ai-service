@@ -10,19 +10,29 @@ class Settings(BaseSettings):
         description="Base URL of Spring chunk service.",
     )
     spring_chunks_path: str = Field(
-        default="/api/laws/chunks/law-chunks",
-        description="Spring endpoint path for paged chunk retrieval.",
+        default="/api/v1/chunks/law-chunks",
+        description="Spring endpoint path for paged law chunk retrieval.",
+    )
+    spring_precedent_chunks_path: str = Field(
+        default="/api/v1/chunks/prec-chunks",
+        description="Spring endpoint path for paged precedent chunk retrieval.",
     )
     default_top_k: int = Field(default=5, ge=1, le=20)
     default_candidate_size: int = Field(default=100, ge=20, le=500)
-    request_timeout_sec: float = Field(default=8.0, gt=0)
+    request_timeout_sec: float = Field(default=120.0, gt=0)
+
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen3:8b"
+
+    # openai_api_key: str
+    # openai_model: str = "gpt-5.5"
+
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_prefix="RETRIEVAL_",
         extra="ignore",
     )
-
 
 @lru_cache
 def get_settings() -> Settings:
