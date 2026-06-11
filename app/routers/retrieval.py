@@ -56,122 +56,74 @@ def get_llm_service() -> LlmService:
     return LlmService()
 
 
-@router.post("/retrieve", response_model=RetrieveResponse)
-async def retrieve_law_chunks(
-    request: RetrieveRequest,
-    service: ChunkSearchService = Depends(get_chunk_search_service),
-) -> RetrieveResponse:
-    top_k = request.top_k
-    search_conditions = service.build_search_conditions(request.question)
-    search_prompt = service.build_search_prompt(
-        question=request.question,
-        conditions=search_conditions,
-    )
-
-    try:
-        chunks, candidate_pagination = await service.retrieve_chunks(
-            conditions=search_conditions,
-            top_k=top_k,
-        )
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Chunk search upstream error: {exc.response.status_code}",
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Chunk search service is unavailable.",
-        ) from exc
-
-    return RetrieveResponse(
-        question=request.question,
-        search_prompt=search_prompt,
-        search_conditions=SearchConditions(**search_conditions),
-        candidate_pagination=candidate_pagination,
-        chunks=chunks,
-        prompt_context=service.build_prompt_context(chunks),
-    )
-
-
-@router.post("/retrieve/precedents", response_model=PrecedentRetrieveResponse)
-async def retrieve_precedent_chunks(
-    request: RetrieveRequest,
-    service: PrecedentSearchService = Depends(get_precedent_search_service),
-) -> PrecedentRetrieveResponse:
-    top_k = request.top_k
-    search_conditions = service.build_search_conditions(request.question)
-    search_prompt = service.build_search_prompt(
-        question=request.question,
-        conditions=search_conditions,
-    )
-
-    try:
-        chunks, candidate_pagination = await service.retrieve_chunks(
-            conditions=search_conditions,
-            top_k=top_k,
-        )
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Precedent chunk search upstream error: {exc.response.status_code}",
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Precedent chunk search service is unavailable.",
-        ) from exc
-
-    return PrecedentRetrieveResponse(
-        question=request.question,
-        search_prompt=search_prompt,
-        search_conditions=PrecedentSearchConditions(**search_conditions),
-        candidate_pagination=candidate_pagination,
-        chunks=chunks,
-        prompt_context=service.build_prompt_context(chunks),
-    )
-
-
 @router.post("/chat", response_model=ChatResponse)
 async def chat_with_llm(
     request: ChatRequest,
     service: ChunkSearchService = Depends(get_chunk_search_service),
+    precedent_service: PrecedentSearchService = Depends(get_precedent_search_service),
     llm_service: LlmService = Depends(get_llm_service),
 ) -> ChatResponse:
-    search_conditions = service.build_search_conditions(request.question)
-
+    law_search_conditions = service.build_search_conditions(request.question)
+    precedent_search_conditions = precedent_service.build_search_conditions(request.question)
+    
+    precedent_chunks = []
+    
     try:
-        chunks, _ = await service.retrieve_chunks(
-            conditions=search_conditions,
-            top_k=request.top_k,
+        law_chunks, _ = await service.retrieve_chunks(
+        conditions=law_search_conditions,
+        top_k=3,
         )
+
+        # precedent_chunks, _ = await precedent_service.retrieve_chunks(
+        #     conditions=precedent_search_conditions,
+        #     top_k=2,
+        # )
+
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Chunk search upstream error: {exc.response.status_code}",
         ) from exc
+
     except httpx.HTTPError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Chunk search service is unavailable.",
         ) from exc
 
-    context = service.build_prompt_context(chunks)
+    law_context = service.build_prompt_context(law_chunks)
+    precedent_context = precedent_service.build_prompt_context(precedent_chunks)
+
+    context = (
+        "[법령 근거]\n"
+        f"{law_context}\n\n"
+        "[판례 근거]\n"
+        f"{precedent_context}"
+    ).strip()
+
+    chunks = law_chunks + precedent_chunks
 
     try:
         answer = await llm_service.generate_answer(
             question=request.question,
             context=context,
         )
+
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"LLM upstream error: {exc.response.status_code}",
         ) from exc
+
     except httpx.HTTPError as exc:
+        print("========== Ollama 호출 실패 ==========")
+        print("에러 타입:", type(exc))
+        print("에러 내용:", str(exc))
+        print("========== Ollama 호출 실패 끝 ==========")
+
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="LLM service is unavailable.",
+            detail=str(exc),
         ) from exc
 
     return ChatResponse(

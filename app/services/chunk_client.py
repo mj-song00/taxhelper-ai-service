@@ -39,6 +39,14 @@ class ChunkSearchClient:
         if case_numbers:
             params["caseNumbers"] = case_numbers
         async with httpx.AsyncClient(timeout=self.timeout_sec) as client:
+            
+            request = client.build_request("GET", url, params=params)
+
+            print("========== SPRING REQUEST ==========")
+            print(request.url)
+            print("========== SPRING REQUEST END ==========")
+
+
             response = await client.get(url, params=params)
             response.raise_for_status()
             data = response.json()
