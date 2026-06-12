@@ -71,7 +71,7 @@ async def chat_with_llm(
     try:
         law_chunks, _ = await service.retrieve_chunks(
         conditions=law_search_conditions,
-        top_k=3,
+        top_k=2,
         )
 
         # precedent_chunks, _ = await precedent_service.retrieve_chunks(

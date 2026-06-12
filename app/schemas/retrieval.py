@@ -93,7 +93,7 @@ class PrecedentRetrieveResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     question: str
-    top_k: int = Field(default=20, ge=1, le=50)
+    top_k: int = Field(default=3, ge=1, le=50)
 
 
 class ChatResponse(BaseModel):

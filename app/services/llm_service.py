@@ -27,10 +27,13 @@ class LlmService:
         payload = {
             "model": self.model,
             "stream": False,
+            "think": False,
             "messages": [
                 {
                     "role": "system",
                     "content": (
+                        "생각 과정을 출력하지 마라. "
+                        "즉시 최종 답변만 작성하라. "
                         "너는 세법/판례 검색 기반 답변 도우미다. "
                         "반드시 제공된 검색 근거만 사용해서 답변해라. "
                         "검색 근거에 없는 내용은 추론하거나 추가하지 마라. "
@@ -43,6 +46,8 @@ class LlmService:
                         "2. 검색 근거 "
                         "3. 근거 부족 여부 "
                         "검색 근거를 설명할 때는 사용자가 제공받은 근거의 문장을 바탕으로 설명해라."
+                        "답변할 때는 근거가 된 법령명과 조문명을 함께 표시하라. "
+                        "조문 번호는 검색 근거의 본문에 있는 번호를 그대로 사용하라. "
                     ),
                 },
                 {
@@ -56,9 +61,9 @@ class LlmService:
                 },
             ],
             "options": {
-                "temperature": 0.2,
+                "temperature": 0.1,
                 "top_p": 0.8,
-                "num_predict": 700,
+                "num_predict": 800,
             },
         }
 

@@ -17,6 +17,8 @@ class ChunkSearchService:
         "소득세": {
             "프리랜서", "사업소득", "근로소득", "종합소득세", "원천징수",
             "지급명세서", "인적공제", "연말정산", "인적용역",
+            "교육비", "세액공제", "특별세액공제",
+            "장기저당차입금", "장기주택저당차입금", "이자상환액", "주택자금", "주택자금공제", "특별소득공제",
         },
         "부가가치세": {
             "부가세", "부가가치세", "매입세액", "매출세액", "영세율",
@@ -34,6 +36,26 @@ class ChunkSearchService:
         "과세표준", "필요경비", "신고", "납부", "환급", "공제",
         "감면", "세무조사", "조세특례", "사업소득", "근로소득",
         "양도소득", "인적용역", "지급명세서", "확정신고",
+        "장기저당차입금", "장기주택저당차입금", "이자상환액", "주택자금", "주택자금공제", "특별소득공제",
+    }
+
+    TAX_SYNONYMS = {
+    "이자상환액": [
+        "이자",
+        "상환",
+        "차입금의 이자",
+        "공제한도",
+        "공제 한도",
+        "장기주택저당차입금의 이자",
+    ],
+    "주담대": [
+        "주택담보대출",
+        "주택저당차입금",
+        "장기주택저당차입금",
+    ],
+    "장기저당차입금": [
+        "장기주택저당차입금",
+    ],
     }
 
     PARTICLE_SUFFIXES = (
@@ -60,6 +82,19 @@ class ChunkSearchService:
 
     def build_search_conditions(self, question: str) -> dict:
         keywords = self.extract_keywords(question)
+
+        expanded_keywords = []
+
+        for keyword in keywords:
+            if keyword not in expanded_keywords:
+                expanded_keywords.append(keyword)
+
+            for synonym in self.TAX_SYNONYMS.get(keyword, []):
+                if synonym not in expanded_keywords:
+                    expanded_keywords.append(synonym)
+
+        keywords = expanded_keywords[:10]
+
         tax_domain = self.infer_tax_domain(keywords)
 
         law_names = self.extract_law_names(question)
@@ -96,6 +131,11 @@ class ChunkSearchService:
         top_k: int,
     ) -> tuple[list[LawChunk], Pagination]:
         top_k = int(top_k)
+
+        print("keywords =", conditions["keywords"])
+        print("query =", conditions["rewritten_query"])
+        print("law_names =", conditions["law_names"])
+
 
         raw_chunks, page_info = await self.client.fetch_chunks(
             candidate_page=1,
@@ -138,7 +178,10 @@ class ChunkSearchService:
         )
         print("========== RANKED RESULT END ==========")
 
-        return ranked[:top_k], Pagination(**page_info)
+        if ranked:
+            ranked = [ranked[0]]
+
+        return ranked, Pagination(**page_info)
 
     @staticmethod
     def build_prompt_context(chunks: list[LawChunk]) -> str:
@@ -150,11 +193,13 @@ class ChunkSearchService:
         for index, chunk in enumerate(chunks, start=1):
             law_name = chunk.law_name or "법령명 없음"
             title = chunk.title or chunk.article or "제목 없음"
-            content = chunk.content or ""
+            content = (chunk.content or "")
 
             contexts.append(
-                f"[{index}] {law_name} - {title}\n"
-                f"{content}"
+                f"[{index}]\n"
+                f"법령명: {law_name}\n"
+                f"조문명: {title}\n"
+                f"내용:\n{content}"
             )
 
         return "\n\n".join(contexts)
@@ -168,7 +213,7 @@ class ChunkSearchService:
             "사용자", "질문", "대한", "관련", "어떤", "어떻게", "경우",
             "가능", "있나요", "있을까요", "해주세요", "알려줘", "정리",
             "있다", "없다", "문의", "대해", "관련해", "대한지",
-            "대상이", "기준", "받으면", "받은경우", "되나요",
+            "대상이", "기준", "받으면", "받은경우", "되나요", 
         }
 
         seen: set[str] = set()
@@ -396,6 +441,7 @@ class ChunkSearchService:
         query_terms: list[str] = []
         seen: set[str] = set()
 
+
         for token in raw_tokens + keywords:
             normalized = ChunkSearchService.normalize_search_token(token)
 
@@ -413,6 +459,9 @@ class ChunkSearchService:
             seen.add(lowered)
             query_terms.append(lowered)
 
+        print("query_terms =", query_terms)
+    
+
         if not query_terms:
             for chunk in chunks:
                 chunk.score = 0.0
@@ -422,6 +471,14 @@ class ChunkSearchService:
         has_three_percent = "3.3%" in query_text or "3.3" in query_text
         has_business_income = "사업소득" in keywords
         has_withholding = "원천징수" in keywords
+
+        has_housing_loan = (
+            "장기저당차입금" in query_text
+            or "이자상환액" in query_text
+            or "주택자금" in query_text
+            or "주택자금공제" in query_text
+            or "특별소득공제" in query_text
+        )
 
         scored: list[tuple[float, LawChunk]] = []
 
@@ -450,6 +507,34 @@ class ChunkSearchService:
                 if "인적용역" in title_text or "인적용역" in content_text:
                     score += 5.0
 
+            if has_housing_loan:
+                has_required_term = (
+                    "장기주택저당차입금" in title_text
+                    or "장기주택저당차입금" in content_text
+                    or "장기저당차입금" in title_text
+                    or "장기저당차입금" in content_text
+                    or "주택자금공제" in title_text
+                    or "주택자금공제" in content_text
+                    or "특별소득공제" in title_text
+                    or "특별소득공제" in content_text
+                )
+
+                if not has_required_term:
+                    chunk.score = 0.0
+                    continue
+
+                if "제52조" in title_text or "특별소득공제" in title_text:
+                    score += 20.0
+
+                if "제112조" in title_text or "주택자금공제" in title_text:
+                    score += 20.0
+
+                if "장기주택저당차입금" in content_text:
+                    score += 15.0
+
+                if "공제한도" in content_text or "공제 한도" in content_text:
+                    score += 10.0
+
             matched_terms = sum(
                 1
                 for term in query_terms
@@ -457,12 +542,11 @@ class ChunkSearchService:
             )
 
             overlap_ratio = matched_terms / len(query_terms)
-            score += overlap_ratio * 10.0
+            score += overlap_ratio * 2.0
 
             chunk.score = round(score, 4)
             scored.append((score, chunk))
-
-        scored.sort(key=lambda item: item[0], reverse=True)
+            scored.sort(key=lambda item: item[0], reverse=True)
 
         ranked = [
             chunk
