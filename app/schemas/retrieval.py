@@ -27,6 +27,7 @@ class LawChunk(BaseModel):
     chunk_id: str
     law_id: str | None = None
     law_name: str | None = None
+    chunk_type: str | None = None
     title: str | None = None
     article: str | None = None
     content: str
@@ -93,7 +94,7 @@ class PrecedentRetrieveResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     question: str
-    top_k: int = Field(default=3, ge=1, le=50)
+    top_k: int = Field(default=5, ge=1, le=20)
 
 
 class ChatResponse(BaseModel):

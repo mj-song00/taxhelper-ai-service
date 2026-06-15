@@ -26,7 +26,8 @@ class ChunkSearchService:
         },
         "법인세": {
             "법인", "접대비", "손금", "손금산입", "손금불산입",
-            "익금", "감가상각", "법인세",
+            "익금", "감가상각", "법인세", "대손충당금", "대손금",
+            "대손", "채권", "구상채권", "가지급금", "채무보증",
         },
     }
 
@@ -37,26 +38,106 @@ class ChunkSearchService:
         "감면", "세무조사", "조세특례", "사업소득", "근로소득",
         "양도소득", "인적용역", "지급명세서", "확정신고",
         "장기저당차입금", "장기주택저당차입금", "이자상환액", "주택자금", "주택자금공제", "특별소득공제",
+        "대손충당금", "대손금", "대손", "채권", "구상채권", "가지급금", "채무보증",
     }
 
     TAX_SYNONYMS = {
-    "이자상환액": [
-        "이자",
-        "상환",
-        "차입금의 이자",
-        "공제한도",
-        "공제 한도",
-        "장기주택저당차입금의 이자",
-    ],
-    "주담대": [
-        "주택담보대출",
-        "주택저당차입금",
-        "장기주택저당차입금",
-    ],
-    "장기저당차입금": [
-        "장기주택저당차입금",
-    ],
+        "이자상환액": [
+            "이자",
+            "상환",
+            "차입금의 이자",
+            "공제한도",
+            "공제 한도",
+            "한도액",
+            "장기주택저당차입금의 이자",
+        ],
+        "주담대": [
+            "주택담보대출",
+            "주택저당차입금",
+            "장기주택저당차입금",
+        ],
+        "장기저당차입금": [
+            "장기주택저당차입금",
+        ],
+        "장기주택저당차입금": [
+            "주택자금공제",
+            "특별소득공제",
+            "소득공제",
+        ],
+        "한도": [
+            "한도액",
+        ],
+        "대손충당금": [
+            "대손금",
+            "손금산입",
+            "설정대상채권",
+            "채권잔액",
+            "제34조",
+            "제19조의2",
+            "제61조",
+            "채무보증",
+            "구상채권",
+            "특수관계인",
+            "업무와 관련 없이",
+            "가지급금",
+        ],
+        "부채": [
+            "채권",
+            "구상채권",
+            "가지급금",
+        ],
+        "부채들": [
+            "채권",
+            "구상채권",
+            "가지급금",
+        ],
+        "제외": [
+            "제외",
+            "제외한다",
+            "제외되는",
+        ],
     }
+
+    HOUSING_LOAN_TERMS = {
+        "장기주택저당차입금", "장기저당차입금", "주택저당차입금",
+        "주택담보대출", "주담대", "이자상환액", "주택자금공제",
+    }
+
+    HOUSING_LOAN_QUERY_HINTS = [
+        "장기주택저당차입금",
+        "이자상환액",
+        "한도액",
+        "공제한도",
+        "특별소득공제",
+        "주택자금공제",
+        "제52조",
+        "제112조",
+        "상환기간",
+        "고정금리",
+        "비거치식",
+        "분할상환",
+    ]
+
+    BAD_DEBT_ALLOWANCE_TERMS = {
+        "대손충당금", "대손금", "대손", "채권", "구상채권", "가지급금", "채무보증",
+    }
+
+    BAD_DEBT_ALLOWANCE_QUERY_HINTS = [
+        "대손충당금",
+        "대손금",
+        "손금산입",
+        "설정대상채권",
+        "채권잔액",
+        "채무보증",
+        "구상채권",
+        "특수관계인",
+        "업무와 관련 없이",
+        "업무무관",
+        "가지급금",
+        "제34조",
+        "제19조의2",
+        "제61조",
+    ]
 
     PARTICLE_SUFFIXES = (
         "으로부터", "에서", "으로", "에게", "한테", "까지", "부터",
@@ -93,7 +174,19 @@ class ChunkSearchService:
                 if synonym not in expanded_keywords:
                     expanded_keywords.append(synonym)
 
-        keywords = expanded_keywords[:10]
+        if self.is_housing_loan_question(question, expanded_keywords):
+            expanded_keywords = self.prepend_unique(
+                self.HOUSING_LOAN_QUERY_HINTS,
+                expanded_keywords,
+            )
+
+        if self.is_bad_debt_allowance_question(question, expanded_keywords):
+            expanded_keywords = self.prepend_unique(
+                self.BAD_DEBT_ALLOWANCE_QUERY_HINTS,
+                expanded_keywords,
+            )
+
+        keywords = expanded_keywords[:20]
 
         tax_domain = self.infer_tax_domain(keywords)
 
@@ -130,7 +223,7 @@ class ChunkSearchService:
         conditions: dict,
         top_k: int,
     ) -> tuple[list[LawChunk], Pagination]:
-        top_k = int(top_k)
+        top_k = max(1, min(int(top_k), 20))
 
         print("keywords =", conditions["keywords"])
         print("query =", conditions["rewritten_query"])
@@ -147,6 +240,18 @@ class ChunkSearchService:
 
         chunks = [self._to_chunk(item) for item in raw_chunks]
 
+        for supplemental_conditions in self.build_supplemental_conditions(conditions):
+            supplemental_raw_chunks, _ = await self.client.fetch_chunks(
+                candidate_page=1,
+                candidate_size=self.candidate_size,
+                law_names=supplemental_conditions["law_names"],
+                keywords=supplemental_conditions["keywords"],
+                rewritten_query=supplemental_conditions["rewritten_query"],
+            )
+            chunks.extend(self._to_chunk(item) for item in supplemental_raw_chunks)
+
+        chunks = self.deduplicate_chunks(chunks)
+
         print("========== SEARCH RESULT ==========")
         for idx, chunk in enumerate(chunks, start=1):
             print(
@@ -159,15 +264,15 @@ class ChunkSearchService:
         if conditions["law_names"]:
             chunks = self.prioritize_by_law_names(chunks, conditions["law_names"])
 
-        page_info["total_elements"] = len(chunks)
-
         ranked = self.rank_chunks(
             chunks=chunks,
             keywords=conditions["keywords"],
             law_names=conditions["law_names"],
             query_text=conditions["original_question"],
-            top_k=len(chunks),
+            top_k=top_k,
         )
+
+        page_info["total_elements"] = len(ranked)
 
         print("========== RANKED RESULT ==========")
         for idx, chunk in enumerate(ranked[:20], start=1):
@@ -177,9 +282,6 @@ class ChunkSearchService:
             f"title={chunk.title}"
         )
         print("========== RANKED RESULT END ==========")
-
-        if ranked:
-            ranked = [ranked[0]]
 
         return ranked, Pagination(**page_info)
 
@@ -204,6 +306,116 @@ class ChunkSearchService:
 
         return "\n\n".join(contexts)
 
+
+    @classmethod
+    def is_housing_loan_question(
+        cls,
+        question: str,
+        keywords: list[str] | None = None,
+    ) -> bool:
+        search_text = " ".join([question, *(keywords or [])])
+
+        return any(term in search_text for term in cls.HOUSING_LOAN_TERMS)
+
+    @classmethod
+    def is_bad_debt_allowance_question(
+        cls,
+        question: str,
+        keywords: list[str] | None = None,
+    ) -> bool:
+        search_text = " ".join([question, *(keywords or [])])
+
+        return any(term in search_text for term in cls.BAD_DEBT_ALLOWANCE_TERMS)
+
+    @staticmethod
+    def prepend_unique(priority_values: list[str], values: list[str]) -> list[str]:
+        return ChunkSearchService.deduplicate_keep_order(priority_values + values)
+
+    @staticmethod
+    def deduplicate_chunks(chunks: list[LawChunk]) -> list[LawChunk]:
+        result: list[LawChunk] = []
+        seen: set[str] = set()
+
+        for chunk in chunks:
+            key = chunk.chunk_id or f"{chunk.law_name}:{chunk.title}:{chunk.content[:80]}"
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            result.append(chunk)
+
+        return result
+
+    @classmethod
+    def build_supplemental_conditions(cls, conditions: dict) -> list[dict]:
+        supplemental_conditions: list[dict] = []
+
+        if cls.is_housing_loan_question(
+            conditions["original_question"],
+            conditions["keywords"],
+        ):
+            law_names = cls.prepend_unique(
+                ["소득세법", "소득세법 시행령"],
+                conditions["law_names"],
+            )
+            keywords = cls.prepend_unique(
+                cls.HOUSING_LOAN_QUERY_HINTS,
+                conditions["keywords"],
+            )
+            supplemental_conditions.extend([
+                {
+                    "law_names": law_names,
+                    "keywords": keywords,
+                    "rewritten_query": " ".join(
+                        cls.deduplicate_keep_order(law_names + keywords)
+                    ),
+                },
+                {
+                    "law_names": law_names,
+                    "keywords": [
+                        "제52조",
+                        "제112조",
+                        "장기주택저당차입금",
+                        "한도액",
+                        "이자상환액",
+                        "상환기간",
+                        "고정금리",
+                        "비거치식",
+                        "분할상환",
+                    ],
+                    "rewritten_query": (
+                        "소득세법 제52조 소득세법 시행령 제112조 "
+                        "장기주택저당차입금 이자상환액 한도액 "
+                        "상환기간 고정금리 비거치식 분할상환"
+                    ),
+                },
+            ])
+
+        if cls.is_bad_debt_allowance_question(
+            conditions["original_question"],
+            conditions["keywords"],
+        ):
+            law_names = cls.prepend_unique(
+                ["법인세법", "법인세법 시행령"],
+                conditions["law_names"],
+            )
+            supplemental_conditions.append(
+                {
+                    "law_names": law_names,
+                    "keywords": cls.prepend_unique(
+                        cls.BAD_DEBT_ALLOWANCE_QUERY_HINTS,
+                        conditions["keywords"],
+                    ),
+                    "rewritten_query": (
+                        "법인세법 제34조 제19조의2 법인세법 시행령 제61조 "
+                        "대손충당금 손금산입 설정대상채권 채권잔액 "
+                        "채무보증 구상채권 특수관계인 업무와 관련 없이 가지급금 제외"
+                    ),
+                }
+            )
+
+        return supplemental_conditions
 
     @staticmethod
     def extract_keywords(question: str) -> list[str]:
@@ -472,12 +684,13 @@ class ChunkSearchService:
         has_business_income = "사업소득" in keywords
         has_withholding = "원천징수" in keywords
 
-        has_housing_loan = (
-            "장기저당차입금" in query_text
-            or "이자상환액" in query_text
-            or "주택자금" in query_text
-            or "주택자금공제" in query_text
-            or "특별소득공제" in query_text
+        has_housing_loan = ChunkSearchService.is_housing_loan_question(
+            query_text,
+            keywords,
+        )
+        has_bad_debt_allowance = ChunkSearchService.is_bad_debt_allowance_question(
+            query_text,
+            keywords,
         )
 
         scored: list[tuple[float, LawChunk]] = []
@@ -485,6 +698,7 @@ class ChunkSearchService:
         for chunk in chunks:
             title_text = (chunk.title or "").lower()
             content_text = (chunk.content or "").lower()
+            chunk_type = (chunk.chunk_type or "").upper()
 
             score = 0.0
 
@@ -507,19 +721,75 @@ class ChunkSearchService:
                 if "인적용역" in title_text or "인적용역" in content_text:
                     score += 5.0
 
+            if has_bad_debt_allowance:
+                combined_text = f"{title_text} {content_text}"
+                target_article = (
+                    "제34조" in title_text
+                    or "제61조" in title_text
+                    or "제19조의2" in title_text
+                    or "제19조의2" in content_text
+                )
+                direct_terms = (
+                    "대손충당금" in combined_text
+                    or "대손금" in combined_text
+                    or "구상채권" in combined_text
+                    or "가지급금" in combined_text
+                    or "채무보증" in combined_text
+                    or "특수관계인" in combined_text
+                    or "업무와 관련 없이" in combined_text
+                    or "업무무관" in combined_text
+                    or "설정대상채권" in combined_text
+                )
+
+                if not (target_article or direct_terms):
+                    chunk.score = 0.0
+                    continue
+
+                if "외국납부세액" in combined_text or "외국법인세액" in combined_text:
+                    chunk.score = 0.0
+                    continue
+
+                if target_article:
+                    score += 55.0
+
+                if "대손충당금" in combined_text:
+                    score += 45.0
+
+                if "구상채권" in combined_text or "가지급금" in combined_text or "채무보증" in combined_text:
+                    score += 40.0
+
+                if "특수관계인" in combined_text or "업무와 관련 없이" in combined_text or "업무무관" in combined_text:
+                    score += 35.0
+
+                if "손금산입" in combined_text or "채권잔액" in combined_text or "설정대상채권" in combined_text:
+                    score += 18.0
+
             if has_housing_loan:
-                has_required_term = (
+                if chunk_type == "ARTICLE":
+                    score += 20.0
+                elif chunk_type == "SUPPLEMENT":
+                    score -= 80.0
+                elif chunk_type == "AMENDMENT":
+                    score -= 50.0
+
+                has_direct_housing_term = (
                     "장기주택저당차입금" in title_text
                     or "장기주택저당차입금" in content_text
                     or "장기저당차입금" in title_text
                     or "장기저당차입금" in content_text
+                    or "주택저당차입금" in title_text
+                    or "주택저당차입금" in content_text
+                    or "이자상환액" in title_text
+                    or "이자상환액" in content_text
                     or "주택자금공제" in title_text
                     or "주택자금공제" in content_text
-                    or "특별소득공제" in title_text
-                    or "특별소득공제" in content_text
+                )
+                has_target_article = (
+                    "제52조" in title_text
+                    or "제112조" in title_text
                 )
 
-                if not has_required_term:
+                if not (has_direct_housing_term or has_target_article):
                     chunk.score = 0.0
                     continue
 
@@ -527,13 +797,19 @@ class ChunkSearchService:
                     score += 20.0
 
                 if "제112조" in title_text or "주택자금공제" in title_text:
-                    score += 20.0
+                    score += 25.0
 
                 if "장기주택저당차입금" in content_text:
-                    score += 15.0
+                    score += 20.0
 
-                if "공제한도" in content_text or "공제 한도" in content_text:
-                    score += 10.0
+                if "한도액" in content_text or "공제한도" in content_text or "공제 한도" in content_text:
+                    score += 18.0
+
+                if "상환기간" in content_text:
+                    score += 8.0
+
+                if "고정금리" in content_text or "비거치식" in content_text or "분할상환" in content_text:
+                    score += 8.0
 
             matched_terms = sum(
                 1
@@ -546,15 +822,27 @@ class ChunkSearchService:
 
             chunk.score = round(score, 4)
             scored.append((score, chunk))
-            scored.sort(key=lambda item: item[0], reverse=True)
+
+        scored.sort(key=lambda item: item[0], reverse=True)
 
         ranked = [
             chunk
             for score, chunk in scored
-            if score > 0 and "삭제" not in (chunk.content or "")
+            if score > 0 and not ChunkSearchService.is_deleted_chunk(chunk)
         ]
 
         return ranked[:top_k]
+
+    @staticmethod
+    def is_deleted_chunk(chunk: LawChunk) -> bool:
+        title = re.sub(r"\s+", "", chunk.title or "")
+        content = re.sub(r"\s+", "", chunk.content or "")
+
+        return (
+            title.endswith("삭제")
+            or content == "삭제"
+            or re.fullmatch(r"제\d+조.*삭제", content) is not None
+        )
 
     @staticmethod
     def prioritize_by_law_names(
@@ -607,6 +895,7 @@ class ChunkSearchService:
             chunk_id=str(chunk_id),
             law_id=item.get("lawId") or item.get("law_id") or item.get("lawID"),
             law_name=law_name,
+            chunk_type=item.get("chunkType") or item.get("chunk_type"),
             title=item.get("title"),
             article=item.get("article") or item.get("articleNo") or item.get("article_no"),
             content=str(content),
