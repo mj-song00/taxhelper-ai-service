@@ -30,8 +30,11 @@ class PrecedentSearchService:
         raw_chunks, page_info = await self.client.fetch_chunks(
             candidate_page=conditions.get("page", 1),
             candidate_size=conditions.get("size", self.candidate_size),
+            chunks_path=self.client.precedent_chunks_path,
             keywords=conditions["keywords"],
             rewritten_query=conditions["rewritten_query"],
+            court_names=conditions["court_names"],
+            case_numbers=conditions["case_numbers"],
         )
 
         chunks = [self._to_chunk(item) for item in raw_chunks]
@@ -100,22 +103,50 @@ class PrecedentSearchService:
             f"- 검색 질의문: {conditions['rewritten_query']}"
         )
 
-    def build_prompt_context(self, chunks: list[PrecedentChunk]) -> str:
+    def build_prompt_context(
+        self,
+        chunks: list[PrecedentChunk],
+        max_content_chars: int = 800,
+    ) -> str:
         if not chunks:
             return ""
 
         lines: list[str] = []
+        preferred_order = {
+            "ISSUE": 0,
+            "SUMMARY": 1,
+            "REFERENCE_ARTICLE": 2,
+            "REFERENCE_CASE": 3,
+            "FULL_TEXT": 4,
+        }
+        context_chunks = sorted(
+            chunks,
+            key=lambda chunk: preferred_order.get((chunk.chunk_type or "").upper(), 99),
+        )
 
-        for idx, chunk in enumerate(chunks, start=1):
+        for idx, chunk in enumerate(context_chunks, start=1):
             source = " / ".join(
                 value
-                for value in [chunk.title, chunk.chunk_type, chunk.precedent_id]
+                for value in [
+                    chunk.title,
+                    chunk.metadata.get("caseName"),
+                    chunk.metadata.get("courtName"),
+                    chunk.metadata.get("caseNumber"),
+                    chunk.chunk_type,
+                ]
                 if value
             )
             header = f"[{idx}] {source}" if source else f"[{idx}]"
 
             lines.append(header)
-            lines.append(chunk.content.strip())
+            if chunk.precedent_id:
+                lines.append(f"precedentId: {chunk.precedent_id}")
+            lines.append(
+                ChunkSearchService.truncate_text(
+                    chunk.content.strip(),
+                    max_content_chars,
+                )
+            )
             lines.append("")
 
         return "\n".join(lines).strip()
@@ -278,5 +309,15 @@ class PrecedentSearchService:
             title=item.get("title"),
             content=str(content),
             score=item.get("score"),
-            metadata=item.get("metadata") or {},
+            metadata={
+                key: value
+                for key, value in {
+                    **(item.get("metadata") or {}),
+                    "caseNumber": item.get("caseNumber") or item.get("case_number"),
+                    "caseName": item.get("caseName") or item.get("case_name"),
+                    "courtName": item.get("courtName") or item.get("court_name"),
+                    "sentencingDate": item.get("sentencingDate") or item.get("sentencing_date"),
+                }.items()
+                if value is not None
+            },
         )

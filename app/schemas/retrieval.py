@@ -100,4 +100,6 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     question: str
     answer: str
-    chunks: list[Any]
+    law_chunks: list[LawChunk] = Field(default_factory=list)
+    precedent_chunks: list[PrecedentChunk] = Field(default_factory=list)
+    chunks: list[Any] = Field(default_factory=list)

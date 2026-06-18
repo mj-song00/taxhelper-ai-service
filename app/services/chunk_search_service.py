@@ -19,6 +19,8 @@ class ChunkSearchService:
             "지급명세서", "인적공제", "연말정산", "인적용역",
             "교육비", "세액공제", "특별세액공제",
             "장기저당차입금", "장기주택저당차입금", "이자상환액", "주택자금", "주택자금공제", "특별소득공제",
+            "해외주식", "미국주식", "외국주식", "국외주식", "주식", "양도소득", "양도소득세",
+            "매매차익", "양도차익", "배당소득", "금융소득", "국외자산",
         },
         "부가가치세": {
             "부가세", "부가가치세", "매입세액", "매출세액", "영세율",
@@ -39,6 +41,8 @@ class ChunkSearchService:
         "양도소득", "인적용역", "지급명세서", "확정신고",
         "장기저당차입금", "장기주택저당차입금", "이자상환액", "주택자금", "주택자금공제", "특별소득공제",
         "대손충당금", "대손금", "대손", "채권", "구상채권", "가지급금", "채무보증",
+        "해외주식", "미국주식", "외국주식", "국외주식", "주식", "매매차익", "양도차익",
+        "배당소득", "금융소득", "국외자산", "양도소득세",
     }
 
     TAX_SYNONYMS = {
@@ -139,6 +143,51 @@ class ChunkSearchService:
         "제61조",
     ]
 
+    BUSINESS_WITHHOLDING_TERMS = {
+        "3.3", "3.3%", "프리랜서", "사업소득", "원천징수", "종합소득세", "종소세",
+    }
+
+    BUSINESS_WITHHOLDING_QUERY_HINTS = [
+        "제70조",
+        "제73조",
+        "제127조",
+        "제137조",
+        "종합소득",
+        "과세표준확정신고",
+        "사업소득",
+        "원천징수",
+        "확정신고",
+        "신고하지 아니할 수 있다",
+    ]
+
+    OVERSEAS_STOCK_TERMS = {
+        "미국 주식", "미국주식", "해외 주식", "해외주식", "외국 주식", "외국주식",
+        "국외 주식", "국외주식", "매매차익", "양도차익", "양도소득", "양도소득세",
+        "배당금", "배당소득", "금융소득",
+    }
+
+    OVERSEAS_STOCK_QUERY_HINTS = [
+        "국외자산",
+        "국외전출자",
+        "양도소득",
+        "양도소득세",
+        "주식등",
+        "외국법인",
+        "양도차익",
+        "양도소득기본공제",
+        "250만원",
+        "제94조",
+        "제104조",
+        "제105조",
+        "제110조",
+        "제118조",
+        "배당소득",
+        "금융소득",
+        "이자소득",
+        "2천만원",
+        "종합소득",
+    ]
+
     PARTICLE_SUFFIXES = (
         "으로부터", "에서", "으로", "에게", "한테", "까지", "부터",
         "처럼", "보다", "마저", "조차", "이라도", "라도", "이나",
@@ -183,6 +232,18 @@ class ChunkSearchService:
         if self.is_bad_debt_allowance_question(question, expanded_keywords):
             expanded_keywords = self.prepend_unique(
                 self.BAD_DEBT_ALLOWANCE_QUERY_HINTS,
+                expanded_keywords,
+            )
+
+        if self.is_business_withholding_question(question, expanded_keywords):
+            expanded_keywords = self.prepend_unique(
+                self.BUSINESS_WITHHOLDING_QUERY_HINTS,
+                expanded_keywords,
+            )
+
+        if self.is_overseas_stock_question(question, expanded_keywords):
+            expanded_keywords = self.prepend_unique(
+                self.OVERSEAS_STOCK_QUERY_HINTS,
                 expanded_keywords,
             )
 
@@ -286,7 +347,7 @@ class ChunkSearchService:
         return ranked, Pagination(**page_info)
 
     @staticmethod
-    def build_prompt_context(chunks: list[LawChunk]) -> str:
+    def build_prompt_context(chunks: list[LawChunk], max_content_chars: int = 1200) -> str:
         if not chunks:
             return "검색된 법령 근거가 없습니다."
 
@@ -295,7 +356,10 @@ class ChunkSearchService:
         for index, chunk in enumerate(chunks, start=1):
             law_name = chunk.law_name or "법령명 없음"
             title = chunk.title or chunk.article or "제목 없음"
-            content = (chunk.content or "")
+            content = ChunkSearchService.truncate_text(
+                chunk.content or "",
+                max_content_chars,
+            )
 
             contexts.append(
                 f"[{index}]\n"
@@ -305,6 +369,15 @@ class ChunkSearchService:
             )
 
         return "\n\n".join(contexts)
+
+    @staticmethod
+    def truncate_text(text: str, max_chars: int) -> str:
+        normalized = re.sub(r"\s+", " ", text).strip()
+
+        if len(normalized) <= max_chars:
+            return normalized
+
+        return normalized[:max_chars].rstrip() + "..."
 
 
     @classmethod
@@ -326,6 +399,34 @@ class ChunkSearchService:
         search_text = " ".join([question, *(keywords or [])])
 
         return any(term in search_text for term in cls.BAD_DEBT_ALLOWANCE_TERMS)
+
+    @classmethod
+    def is_business_withholding_question(
+        cls,
+        question: str,
+        keywords: list[str] | None = None,
+    ) -> bool:
+        search_text = " ".join([question, *(keywords or [])])
+
+        return (
+            any(term in search_text for term in cls.BUSINESS_WITHHOLDING_TERMS)
+            and any(term in search_text for term in ("신고", "종합소득세", "종소세"))
+        )
+
+    @classmethod
+    def is_overseas_stock_question(
+        cls,
+        question: str,
+        keywords: list[str] | None = None,
+    ) -> bool:
+        search_text = " ".join([question, *(keywords or [])])
+        compact_text = search_text.replace(" ", "")
+
+        return (
+            any(term.replace(" ", "") in compact_text for term in cls.OVERSEAS_STOCK_TERMS)
+            or ("미국" in search_text and "주식" in search_text)
+            or ("해외" in search_text and "주식" in search_text)
+        )
 
     @staticmethod
     def prepend_unique(priority_values: list[str], values: list[str]) -> list[str]:
@@ -415,6 +516,51 @@ class ChunkSearchService:
                 }
             )
 
+        if cls.is_business_withholding_question(
+            conditions["original_question"],
+            conditions["keywords"],
+        ):
+            law_names = cls.prepend_unique(
+                ["소득세법", "소득세법 시행령"],
+                conditions["law_names"],
+            )
+            supplemental_conditions.append(
+                {
+                    "law_names": law_names,
+                    "keywords": cls.prepend_unique(
+                        cls.BUSINESS_WITHHOLDING_QUERY_HINTS,
+                        conditions["keywords"],
+                    ),
+                    "rewritten_query": (
+                        "소득세법 제70조 제73조 제127조 소득세법 시행령 제137조 "
+                        "종합소득 과세표준확정신고 사업소득 원천징수 확정신고 예외"
+                    ),
+                }
+            )
+
+        if cls.is_overseas_stock_question(
+            conditions["original_question"],
+            conditions["keywords"],
+        ):
+            law_names = cls.prepend_unique(
+                ["소득세법", "소득세법 시행령"],
+                conditions["law_names"],
+            )
+            supplemental_conditions.append(
+                {
+                    "law_names": law_names,
+                    "keywords": cls.prepend_unique(
+                        cls.OVERSEAS_STOCK_QUERY_HINTS,
+                        conditions["keywords"],
+                    ),
+                    "rewritten_query": (
+                        "소득세법 제94조 제104조 제105조 제110조 제118조 "
+                        "국외자산 외국법인 주식등 양도소득 양도소득세 "
+                        "양도차익 양도소득기본공제 250만원 배당소득 금융소득 2천만원"
+                    ),
+                }
+            )
+
         return supplemental_conditions
 
     @staticmethod
@@ -425,7 +571,8 @@ class ChunkSearchService:
             "사용자", "질문", "대한", "관련", "어떤", "어떻게", "경우",
             "가능", "있나요", "있을까요", "해주세요", "알려줘", "정리",
             "있다", "없다", "문의", "대해", "관련해", "대한지",
-            "대상이", "기준", "받으면", "받은경우", "되나요", 
+            "대상이", "기준", "받으면", "받은경우", "되나요",
+            "세금", "내야", "하나요", "나요", "수익",
         }
 
         seen: set[str] = set()
@@ -692,6 +839,14 @@ class ChunkSearchService:
             query_text,
             keywords,
         )
+        has_business_withholding = ChunkSearchService.is_business_withholding_question(
+            query_text,
+            keywords,
+        )
+        has_overseas_stock = ChunkSearchService.is_overseas_stock_question(
+            query_text,
+            keywords,
+        )
 
         scored: list[tuple[float, LawChunk]] = []
 
@@ -763,6 +918,82 @@ class ChunkSearchService:
 
                 if "손금산입" in combined_text or "채권잔액" in combined_text or "설정대상채권" in combined_text:
                     score += 18.0
+
+            if has_business_withholding:
+                combined_text = f"{title_text} {content_text}"
+                target_article = (
+                    "제70조" in title_text
+                    or "제73조" in title_text
+                    or "제127조" in title_text
+                    or "제137조" in title_text
+                )
+                direct_terms = (
+                    "종합소득" in combined_text
+                    or "과세표준확정신고" in combined_text
+                    or "사업소득" in combined_text
+                    or "원천징수" in combined_text
+                )
+
+                if not (target_article or direct_terms):
+                    chunk.score = 0.0
+                    continue
+
+                if target_article:
+                    score += 60.0
+
+                if "제70조" in title_text or "종합소득 과세표준확정신고" in combined_text:
+                    score += 40.0
+
+                if "제73조" in title_text or "확정신고의 예외" in combined_text:
+                    score += 35.0
+
+                if "제137조" in title_text or "대통령령으로 정하는 사업소득" in combined_text:
+                    score += 30.0
+
+                if "사업소득" in combined_text and "원천징수" in combined_text:
+                    score += 25.0
+
+            if has_overseas_stock:
+                combined_text = f"{title_text} {content_text}"
+                target_article = (
+                    "제94조" in title_text
+                    or "제104조" in title_text
+                    or "제105조" in title_text
+                    or "제110조" in title_text
+                    or "제118조" in title_text
+                )
+                direct_terms = (
+                    "국외자산" in combined_text
+                    or "외국법인" in combined_text
+                    or "주식등" in combined_text
+                    or "주식 등" in combined_text
+                    or "양도소득" in combined_text
+                    or "양도소득기본공제" in combined_text
+                    or "배당소득" in combined_text
+                    or "금융소득" in combined_text
+                )
+
+                if not (target_article or direct_terms):
+                    chunk.score = 0.0
+                    continue
+
+                if target_article:
+                    score += 55.0
+
+                if "국외자산" in combined_text or "외국법인" in combined_text:
+                    score += 45.0
+
+                if "주식등" in combined_text or "주식 등" in combined_text:
+                    score += 40.0
+
+                if "양도소득" in combined_text or "양도차익" in combined_text:
+                    score += 35.0
+
+                if "250만원" in combined_text or "양도소득기본공제" in combined_text:
+                    score += 30.0
+
+                if "배당소득" in combined_text or "금융소득" in combined_text:
+                    score += 25.0
 
             if has_housing_loan:
                 if chunk_type == "ARTICLE":

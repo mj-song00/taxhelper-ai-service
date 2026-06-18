@@ -6,9 +6,16 @@ import httpx
 
 
 class ChunkSearchClient:
-    def __init__(self, base_url: str, chunks_path: str, timeout_sec: float) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        chunks_path: str,
+        timeout_sec: float,
+        precedent_chunks_path: str | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.chunks_path = chunks_path
+        self.precedent_chunks_path = precedent_chunks_path or chunks_path
         self.timeout_sec = timeout_sec
 
     async def fetch_chunks(

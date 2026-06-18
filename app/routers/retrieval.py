@@ -12,6 +12,7 @@ from app.schemas.retrieval import (
 from app.services.chunk_client import ChunkSearchClient
 from app.services.chunk_search_service import ChunkSearchService
 from app.services.llm_service import LlmService
+from app.services.precedent_search_service import PrecedentSearchService
 
 router = APIRouter(tags=["retrieval"])
 
@@ -22,9 +23,25 @@ def get_chunk_search_service() -> ChunkSearchService:
     client = ChunkSearchClient(
         base_url=settings.spring_base_url,
         chunks_path=settings.spring_chunks_path,
+        precedent_chunks_path=settings.spring_precedent_chunks_path,
         timeout_sec=settings.request_timeout_sec,
     )
     return ChunkSearchService(
+        client=client,
+        candidate_size=settings.default_candidate_size,
+    )
+
+
+@lru_cache
+def get_precedent_search_service() -> PrecedentSearchService:
+    settings = get_settings()
+    client = ChunkSearchClient(
+        base_url=settings.spring_base_url,
+        chunks_path=settings.spring_chunks_path,
+        precedent_chunks_path=settings.spring_precedent_chunks_path,
+        timeout_sec=settings.request_timeout_sec,
+    )
+    return PrecedentSearchService(
         client=client,
         candidate_size=settings.default_candidate_size,
     )
@@ -38,14 +55,20 @@ def get_llm_service() -> LlmService:
 @router.post("/chat", response_model=ChatResponse)
 async def chat_with_llm(
     request: ChatRequest,
-    service: ChunkSearchService = Depends(get_chunk_search_service),
+    law_service: ChunkSearchService = Depends(get_chunk_search_service),
+    precedent_service: PrecedentSearchService = Depends(get_precedent_search_service),
     llm_service: LlmService = Depends(get_llm_service),
 ) -> ChatResponse:
-    law_search_conditions = service.build_search_conditions(request.question)
+    law_search_conditions = law_service.build_search_conditions(request.question)
+    precedent_search_conditions = precedent_service.build_search_conditions(request.question)
 
     try:
-        law_chunks, _ = await service.retrieve_chunks(
+        law_chunks, _ = await law_service.retrieve_chunks(
             conditions=law_search_conditions,
+            top_k=request.top_k,
+        )
+        precedent_chunks, _ = await precedent_service.retrieve_chunks(
+            conditions=precedent_search_conditions,
             top_k=request.top_k,
         )
 
@@ -63,7 +86,9 @@ async def chat_with_llm(
 
     context = (
         "[법령 근거]\n"
-        f"{service.build_prompt_context(law_chunks)}"
+        f"{law_service.build_prompt_context(law_chunks)}\n\n"
+        "[판례 근거]\n"
+        f"{precedent_service.build_prompt_context(precedent_chunks) or '검색된 판례 근거가 없습니다.'}"
     ).strip()
 
     try:
@@ -92,5 +117,7 @@ async def chat_with_llm(
     return ChatResponse(
         question=request.question,
         answer=answer,
-        chunks=law_chunks,
+        law_chunks=law_chunks,
+        precedent_chunks=precedent_chunks,
+        chunks=[*law_chunks, *precedent_chunks],
     )
