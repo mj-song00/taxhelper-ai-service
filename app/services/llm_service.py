@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import re
+
 import httpx
 
 from app.core.config import get_settings
@@ -30,7 +33,7 @@ class LlmService:
 
         payload = {
             "model": self.model,
-            "stream": False,
+            "stream": True,
             "think": False,
             "messages": [
                 {
@@ -72,7 +75,7 @@ class LlmService:
             "options": {
                 "temperature": 0.1,
                 "top_p": 0.8,
-                "num_predict": 800,
+                "num_predict": 320,
             },
         }
 
@@ -103,10 +106,19 @@ class LlmService:
             })
             print("========== END PAYLOAD ==========")
 
+            content_parts: list[str] = []
             async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(url, json=payload)
-                response.raise_for_status()
-                data = response.json()
+                async with client.stream("POST", url, json=payload) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line.strip():
+                            continue
+                        event = json.loads(line)
+                        piece = event.get("message", {}).get("content")
+                        if isinstance(piece, str):
+                            content_parts.append(piece)
+
+            data = {"message": {"content": "".join(content_parts)}}
 
         except httpx.ReadTimeout:
             print("========== Ollama 호출 실패 ==========")
@@ -149,6 +161,10 @@ class LlmService:
 
     @staticmethod
     def try_generate_direct_answer(question: str, context: str) -> str | None:
+        petroleum_answer = LlmService.try_generate_petroleum_tax_answer(question, context)
+        if petroleum_answer is not None:
+            return petroleum_answer
+
         overseas_stock_answer = LlmService.try_generate_overseas_stock_answer(question, context)
         if overseas_stock_answer is not None:
             return overseas_stock_answer
@@ -203,6 +219,50 @@ class LlmService:
             "소득세법 시행령 제112조의 요건 충족 여부를 함께 확인해야 합니다."
         )
 
+
+    @staticmethod
+    def try_generate_petroleum_tax_answer(question: str, context: str) -> str | None:
+        compact_question = question.replace(" ", "")
+        if not any(term in compact_question for term in ("개별소비세", "개소세", "유류세")):
+            return None
+        if not any(term in question.lower() for term in ("유종", "석유", "휘발유", "경유", "등유")):
+            return None
+
+        normalized = re.sub(r"\s+", " ", context)
+        fuels = (
+            ("가", "휘발유", "리터"),
+            ("나", "경유", "리터"),
+            ("다", "등유", "리터"),
+            ("라", "중유", "리터"),
+            ("마", "프로판", "킬로그램"),
+            ("바", "부탄", "킬로그램"),
+            ("사", "천연가스", "킬로그램"),
+            ("자", "유연탄", "킬로그램"),
+        )
+        rates: list[tuple[str, str, str]] = []
+
+        for item_prefix, fuel, unit in fuels:
+            match = re.search(
+                rf"{item_prefix}\. ?\s*.{{0,80}}?{re.escape(fuel)}.{{0,180}}?{unit}당\s*([0-9,]+)원",
+                normalized,
+            )
+            if match:
+                rates.append((fuel, unit, match.group(1)))
+
+        # 검색 근거에서 최소 3개 유종의 세율이 확인된 경우에만
+        # 즉시 답변하고, 근거가 부족하면 기존 LLM 경로를 사용한다.
+        if len(rates) < 3:
+            return None
+
+        lines = [f"- {fuel}: {unit}당 {amount}원" for fuel, unit, amount in rates]
+        return (
+            "1. 결론\n"
+            + "\n".join(lines)
+            + "\n\n2. 검색 근거\n"
+            + "개별소비세법 제1조의 과세대상과 세율 규정에서 확인한 기본세율입니다."
+            + "\n\n3. 근거 부족 여부\n"
+            + "한시적 탄력세율의 실제 적용액은 별도 확인이 필요합니다."
+        )
 
     @staticmethod
     def try_generate_housing_loan_requirement_answer(question: str, context: str) -> str | None:

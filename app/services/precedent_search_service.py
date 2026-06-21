@@ -8,6 +8,10 @@ from app.services.chunk_search_service import ChunkSearchService
 
 
 class PrecedentSearchService:
+    PRECEDENT_REQUEST_TERMS = (
+        "판례", "판결", "판시사항", "판결요지", "사건번호",
+        "대법원", "고등법원", "지방법원", "행정법원", "조세심판원",
+    )
     CHUNK_TYPE_HINTS = {
         "ISSUE": ("판시사항", "쟁점"),
         "SUMMARY": ("판결요지", "요지"),
@@ -77,6 +81,18 @@ class PrecedentSearchService:
             "page": 1,
             "size": self.candidate_size,
         }
+
+    @classmethod
+    def should_search(cls, question: str) -> bool:
+        """판례를 요청한 질문에서만 판례 검색을 실행한다.
+
+        세율·금액·신고 기한처럼 법령만으로 답할 수 있는 질문에
+        판례 전문을 섞지 않는다.
+        """
+        compact = re.sub(r"\s+", "", question)
+        if cls.extract_case_numbers(question):
+            return True
+        return any(term in compact for term in cls.PRECEDENT_REQUEST_TERMS)
 
     @staticmethod
     def build_search_prompt(question: str, conditions: dict) -> str:
@@ -253,7 +269,9 @@ class PrecedentSearchService:
             for term in query_terms:
                 title_hits = title_text.count(term)
                 content_hits = content_text.count(term)
-                score += (title_hits * 3.0) + (content_hits * 1.0)
+                # 긴 FULL_TEXT가 단순 반복 횟수로 상위를 독점하지
+                # 못하도록 용어별 횟수를 제한한다.
+                score += (min(title_hits, 2) * 3.0) + min(content_hits, 3)
 
             matched_terms = sum(
                 1
@@ -263,6 +281,15 @@ class PrecedentSearchService:
 
             overlap_ratio = matched_terms / len(query_terms)
             score += overlap_ratio * 10.0
+
+            if (chunk.chunk_type or "").upper() == "FULL_TEXT":
+                score -= 4.0
+
+            # 질의 핵심 용어의 40%도 맞지 않으면 관련 판례로 보지 않는다.
+            if overlap_ratio < 0.40:
+                chunk.score = 0.0
+                scored.append((0.0, chunk))
+                continue
 
             if (
                 preferred_types
@@ -280,10 +307,6 @@ class PrecedentSearchService:
         scored.sort(key=lambda item: item[0], reverse=True)
 
         ranked = [chunk for score, chunk in scored if score > 0]
-
-        if len(ranked) < top_k:
-            remainder = [chunk for score, chunk in scored if score == 0]
-            ranked.extend(remainder[: top_k - len(ranked)])
 
         return ranked[:top_k]
 

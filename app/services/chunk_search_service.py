@@ -11,6 +11,7 @@ class ChunkSearchService:
         "소득세": ["소득세법", "소득세법 시행령", "소득세법 시행규칙"],
         "부가가치세": ["부가가치세법", "부가가치세법 시행령", "부가가치세법 시행규칙"],
         "법인세": ["법인세법", "법인세법 시행령", "법인세법 시행규칙"],
+        "개별소비세": ["개별소비세법", "개별소비세법 시행령", "개별소비세법 시행규칙"],
     }
 
     DOMAIN_HINTS = {
@@ -31,6 +32,11 @@ class ChunkSearchService:
             "익금", "감가상각", "법인세", "대손충당금", "대손금",
             "대손", "채권", "구상채권", "가지급금", "채무보증",
         },
+        "개별소비세": {
+            "개별소비세", "개별 소비세", "개소세", "유류세", "유종",
+            "유종별", "석유류", "휘발유", "경유", "등유", "중유", "프로판",
+            "부탄", "액화석유가스", "LPG", "천연가스", "유연탄", "세율",
+        },
     }
 
     TAX_KEYWORDS = {
@@ -39,6 +45,8 @@ class ChunkSearchService:
         "과세표준", "필요경비", "신고", "납부", "환급", "공제",
         "감면", "세무조사", "조세특례", "사업소득", "근로소득",
         "양도소득", "인적용역", "지급명세서", "확정신고",
+        "개별소비세", "개소세", "유류세", "석유류", "유종별",
+        "휘발유", "경유", "등유", "중유", "프로판", "부탄", "세율",
         "장기저당차입금", "장기주택저당차입금", "이자상환액", "주택자금", "주택자금공제", "특별소득공제",
         "대손충당금", "대손금", "대손", "채권", "구상채권", "가지급금", "채무보증",
         "해외주식", "미국주식", "외국주식", "국외주식", "주식", "매매차익", "양도차익",
@@ -46,6 +54,9 @@ class ChunkSearchService:
     }
 
     TAX_SYNONYMS = {
+        "유종별": ["석유류", "휘발유", "경유", "등유", "중유", "프로판", "부탄"],
+        "유종": ["석유류", "휘발유", "경유", "등유", "중유", "프로판", "부탄"],
+        "석유류": ["휘발유", "경유", "등유", "중유", "석유가스", "프로판", "부탄"],
         "이자상환액": [
             "이자",
             "상환",
@@ -188,6 +199,17 @@ class ChunkSearchService:
         "종합소득",
     ]
 
+    PETROLEUM_TAX_TERMS = {
+        "유종", "유종별", "석유류", "유류", "휘발유", "경유", "등유",
+        "중유", "석유가스", "액화석유가스", "lpg", "프로판", "부탄",
+    }
+
+    PETROLEUM_TAX_QUERY_HINTS = [
+        "개별소비세법", "제1조", "과세대상과 세율", "석유류", "수량",
+        "리터당", "킬로그램당", "휘발유", "경유", "등유", "중유",
+        "프로판", "부탄", "천연가스", "유연탄",
+    ]
+
     PARTICLE_SUFFIXES = (
         "으로부터", "에서", "으로", "에게", "한테", "까지", "부터",
         "처럼", "보다", "마저", "조차", "이라도", "라도", "이나",
@@ -212,6 +234,11 @@ class ChunkSearchService:
 
     def build_search_conditions(self, question: str) -> dict:
         keywords = self.extract_keywords(question)
+
+        # 사용자가 `개별 소비세`로 띄어 써도 법령명은 하나의
+        # 검색어로 보존한다.
+        if "개별소비세" in question.replace(" ", ""):
+            keywords = self.prepend_unique(["개별소비세"], keywords)
 
         expanded_keywords = []
 
@@ -244,6 +271,12 @@ class ChunkSearchService:
         if self.is_overseas_stock_question(question, expanded_keywords):
             expanded_keywords = self.prepend_unique(
                 self.OVERSEAS_STOCK_QUERY_HINTS,
+                expanded_keywords,
+            )
+
+        if self.is_petroleum_tax_question(question, expanded_keywords):
+            expanded_keywords = self.prepend_unique(
+                self.PETROLEUM_TAX_QUERY_HINTS,
                 expanded_keywords,
             )
 
@@ -347,7 +380,11 @@ class ChunkSearchService:
         return ranked, Pagination(**page_info)
 
     @staticmethod
-    def build_prompt_context(chunks: list[LawChunk], max_content_chars: int = 1200) -> str:
+    def build_prompt_context(
+        chunks: list[LawChunk],
+        max_content_chars: int = 1200,
+        keywords: list[str] | None = None,
+    ) -> str:
         if not chunks:
             return "검색된 법령 근거가 없습니다."
 
@@ -356,9 +393,10 @@ class ChunkSearchService:
         for index, chunk in enumerate(chunks, start=1):
             law_name = chunk.law_name or "법령명 없음"
             title = chunk.title or chunk.article or "제목 없음"
-            content = ChunkSearchService.truncate_text(
+            content = ChunkSearchService.extract_relevant_excerpt(
                 chunk.content or "",
                 max_content_chars,
+                keywords or [],
             )
 
             contexts.append(
@@ -369,6 +407,41 @@ class ChunkSearchService:
             )
 
         return "\n\n".join(contexts)
+
+    @staticmethod
+    def extract_relevant_excerpt(
+        text: str,
+        max_chars: int,
+        keywords: list[str],
+    ) -> str:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if len(normalized) <= max_chars:
+            return normalized
+
+        useful_keywords = [
+            keyword.lower()
+            for keyword in keywords
+            if len(keyword) >= 2 and keyword not in {"개별소비세법", "제1조"}
+        ]
+        lowered = normalized.lower()
+
+        # 여러 유종이 연속해 나오는 세율표는 휘발유 위치를
+        # 기준으로 잘라야 조문 앞부만 전달되는 문제를 피한다.
+        if all(term in lowered for term in ("휘발유", "경유", "등유")):
+            anchor = lowered.find("휘발유")
+        else:
+            positions = [lowered.find(term) for term in useful_keywords if term in lowered]
+            anchor = min(positions) if positions else 0
+
+        start = max(0, anchor - 120)
+        end = min(len(normalized), start + max_chars)
+        excerpt = normalized[start:end].strip()
+
+        if start > 0:
+            excerpt = "..." + excerpt
+        if end < len(normalized):
+            excerpt += "..."
+        return excerpt
 
     @staticmethod
     def truncate_text(text: str, max_chars: int) -> str:
@@ -427,6 +500,21 @@ class ChunkSearchService:
             or ("미국" in search_text and "주식" in search_text)
             or ("해외" in search_text and "주식" in search_text)
         )
+
+    @classmethod
+    def is_petroleum_tax_question(
+        cls,
+        question: str,
+        keywords: list[str] | None = None,
+    ) -> bool:
+        search_text = " ".join([question, *(keywords or [])]).lower()
+        compact_text = search_text.replace(" ", "")
+        has_excise_tax = any(
+            term in compact_text
+            for term in ("개별소비세", "개소세", "유류세")
+        )
+        has_petroleum = any(term in search_text for term in cls.PETROLEUM_TAX_TERMS)
+        return has_excise_tax and has_petroleum
 
     @staticmethod
     def prepend_unique(priority_values: list[str], values: list[str]) -> list[str]:
@@ -561,6 +649,25 @@ class ChunkSearchService:
                 }
             )
 
+        if cls.is_petroleum_tax_question(
+            conditions["original_question"],
+            conditions["keywords"],
+        ):
+            law_names = cls.prepend_unique(
+                ["개별소비세법", "개별소비세법 시행령"],
+                conditions["law_names"],
+            )
+            supplemental_conditions.append(
+                {
+                    "law_names": law_names,
+                    "keywords": cls.PETROLEUM_TAX_QUERY_HINTS,
+                    "rewritten_query": (
+                        "개별소비세법 제1조 과세대상과 세율 석유류 수량 "
+                        "리터당 휘발유 경유 등유 중유 프로판 부탄"
+                    ),
+                }
+            )
+
         return supplemental_conditions
 
     @staticmethod
@@ -573,6 +680,7 @@ class ChunkSearchService:
             "있다", "없다", "문의", "대해", "관련해", "대한지",
             "대상이", "기준", "받으면", "받은경우", "되나요",
             "세금", "내야", "하나요", "나요", "수익",
+            "같은",
         }
 
         seen: set[str] = set()
@@ -847,6 +955,10 @@ class ChunkSearchService:
             query_text,
             keywords,
         )
+        has_petroleum_tax = ChunkSearchService.is_petroleum_tax_question(
+            query_text,
+            keywords,
+        )
 
         scored: list[tuple[float, LawChunk]] = []
 
@@ -856,6 +968,32 @@ class ChunkSearchService:
             chunk_type = (chunk.chunk_type or "").upper()
 
             score = 0.0
+
+            if has_petroleum_tax:
+                combined_text = f"{title_text} {content_text}"
+                fuel_matches = sum(
+                    1
+                    for term in ("휘발유", "경유", "등유", "중유", "프로판", "부탄")
+                    if term in combined_text
+                )
+                has_rate_marker = any(
+                    marker in combined_text
+                    for marker in ("세율", "리터당", "킬로그램당", "과세대상")
+                )
+
+                # `경유`는 `~를 경유하여`로도 많이 쓰인다. 다른 유종과
+                # 세율 표시가 함께 없으면 석유류 세율 근거로 보지 않는다.
+                if fuel_matches < 2 or not has_rate_marker:
+                    chunk.score = 0.0
+                    continue
+
+                if "개별소비세법" in (chunk.law_name or ""):
+                    score += 45.0
+                if "제1조" in title_text or "과세대상과 세율" in title_text:
+                    score += 80.0
+                score += fuel_matches * 12.0
+                if "담배" in title_text:
+                    score -= 100.0
 
             for term in query_terms:
                 title_hits = title_text.count(term)
