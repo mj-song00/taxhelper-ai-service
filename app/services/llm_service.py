@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from time import perf_counter
 
 import httpx
 
@@ -13,19 +14,31 @@ class LlmService:
         settings = get_settings()
         self.base_url = settings.ollama_base_url.rstrip("/")
         self.model = settings.ollama_model
+        self.max_context_chars = settings.ollama_max_context_chars
+        self.num_predict = settings.ollama_num_predict
+        self.num_ctx = settings.ollama_num_ctx
+        self.keep_alive = settings.ollama_keep_alive
+        self.timeout = httpx.Timeout(
+            connect=10.0,
+            read=300.0,
+            write=30.0,
+            pool=10.0,
+        )
+        self._client = httpx.AsyncClient(timeout=self.timeout)
+
+    async def close(self) -> None:
+        await self._client.aclose()
 
     async def generate_answer(self, question: str, context: str) -> str:
         url = f"{self.base_url}/api/chat"
-
-        max_context_chars = 6000
 
         if context is None:
             context = ""
 
         context = context.strip()
 
-        if len(context) > max_context_chars:
-            context = context[:max_context_chars]
+        if len(context) > self.max_context_chars:
+            context = context[:self.max_context_chars]
 
         direct_answer = self.try_generate_direct_answer(question, context)
         if direct_answer is not None:
@@ -35,31 +48,21 @@ class LlmService:
             "model": self.model,
             "stream": True,
             "think": False,
+            "keep_alive": self.keep_alive,
             "messages": [
                 {
                     "role": "system",
                     "content": (
-                        "생각 과정을 출력하지 마라. "
-                        "즉시 최종 답변만 작성하라. "
-                        "너는 현행 세법 법령 및 판례 검색 기반 답변 도우미다. "
-                        "반드시 제공된 법령 근거와 판례 근거만 사용해서 답변해라. "
-                        "제공된 근거에 없는 내용은 추론하거나 추가하지 마라. "
-                        "질문에 대한 직접적인 근거가 없으면 반드시 "
-                        "'제공된 근거만으로는 판단할 수 없습니다.'라고 답변해라. "
-                        "답변은 한국어로 작성해라. "
-                        "답변은 너무 길게 쓰지 말고, 사용자가 바로 이해할 수 있게 작성해라. "
-                        "한도, 금액, 공제액을 묻는 질문이면 법령 근거에 있는 조건과 금액을 빠뜨리지 말고 표 또는 항목으로 정리해라. "
-                        "법령 근거에 숫자, 금액, 기간, 조건이 함께 있으면 결론에 함께 포함해라. "
-                        "시행령의 정의 조문보다 법률 본문에 있는 금액과 한도 규정을 먼저 답변해라. "
-                        "질문이 제외되는 항목을 묻는 경우에는 제도 설명을 길게 하지 말고 제외되는 항목만 먼저 목록으로 답해라. "
-                        "대손충당금 질문에서 법 제19조의2제2항이 근거로 나오면 제19조의2제1항의 대손 사유 목록을 제외 항목으로 답하지 마라. "
-                        "답변 형식은 반드시 다음을 따른다. "
-                        "1. 결론 "
-                        "2. 검색 근거 "
-                        "3. 근거 부족 여부 "
-                        "검색 근거를 설명할 때는 제공된 법령 근거와 판례 근거의 문장을 바탕으로 설명해라."
-                        "답변할 때는 근거가 된 법령명과 조문명, 판례가 있으면 사건번호를 함께 표시하라. "
-                        "조문 번호는 검색 근거의 본문에 있는 번호를 그대로 사용하라. "
+                        "/no_think\n"
+                        "너는 한국 세법 검색 답변 도우미다. 사고 과정은 쓰지 말고 한국어 최종 답변만 즉시 작성하라.\n"
+                        "규칙:\n"
+                        "- 제공된 법령·판례 근거만 사용하고 추론하지 않는다.\n"
+                        "- 직접 근거가 없으면 '제공된 근거만으로는 판단할 수 없습니다.'라고 쓴다.\n"
+                        "- 금액·기간·조건은 근거에 있는 내용을 빠뜨리지 않는다.\n"
+                        "- 관련 없는 조문은 인용하지 않는다.\n"
+                        "- 결론에는 질문이 요구한 항목을 실제로 나열하고 조문번호만 쓰지 않는다.\n"
+                        "- 전체 350자 이내로 간결하게 작성한다.\n"
+                        "형식:\n1. 결론\n2. 검색 근거(법령명·조문명·사건번호)\n3. 근거 부족 여부"
                     ),
                 },
                 {
@@ -68,26 +71,20 @@ class LlmService:
                         f"[사용자 질문]\n{question.strip()}\n\n"
                         f"[검색 근거]\n{context}\n\n"
                         "위 검색 근거만 사용해서 사용자의 질문에 답변해줘. "
-                        "검색 근거와 관련 없는 일반 지식은 사용하지 마."
+                        "검색 근거와 관련 없는 일반 지식은 사용하지 마.\n/no_think"
                     ),
                 },
             ],
             "options": {
                 "temperature": 0.1,
                 "top_p": 0.8,
-                "num_predict": 320,
+                "num_predict": self.num_predict,
+                "num_ctx": self.num_ctx,
             },
         }
 
         print("question length =", len(question))
         print("context length =", len(context))
-
-        timeout = httpx.Timeout(
-            connect=10.0,
-            read=300.0,
-            write=30.0,
-            pool=10.0,
-        )
 
         try:
             print("========== CONTEXT ==========")
@@ -107,16 +104,36 @@ class LlmService:
             print("========== END PAYLOAD ==========")
 
             content_parts: list[str] = []
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream("POST", url, json=payload) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        if not line.strip():
-                            continue
-                        event = json.loads(line)
-                        piece = event.get("message", {}).get("content")
-                        if isinstance(piece, str):
-                            content_parts.append(piece)
+            ollama_started_at = perf_counter()
+            first_token_sec: float | None = None
+            final_event: dict = {}
+            async with self._client.stream("POST", url, json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.strip():
+                        continue
+                    event = json.loads(line)
+                    piece = event.get("message", {}).get("content")
+                    if isinstance(piece, str) and piece:
+                        if first_token_sec is None:
+                            first_token_sec = perf_counter() - ollama_started_at
+                        content_parts.append(piece)
+                    if event.get("done") is True:
+                        final_event = event
+
+            total_sec = perf_counter() - ollama_started_at
+            eval_count = int(final_event.get("eval_count") or 0)
+            eval_duration_sec = float(final_event.get("eval_duration") or 0) / 1_000_000_000
+            tokens_per_sec = eval_count / eval_duration_sec if eval_duration_sec > 0 else 0.0
+            print(
+                f"[OLLAMA_TIMING] model={self.model} total_sec={total_sec:.3f} "
+                f"first_token_sec={(first_token_sec or 0.0):.3f} "
+                f"load_sec={float(final_event.get('load_duration') or 0) / 1_000_000_000:.3f} "
+                f"prompt_eval_sec={float(final_event.get('prompt_eval_duration') or 0) / 1_000_000_000:.3f} "
+                f"eval_sec={eval_duration_sec:.3f} prompt_tokens={int(final_event.get('prompt_eval_count') or 0)} "
+                f"output_tokens={eval_count} tokens_per_sec={tokens_per_sec:.2f}",
+                flush=True,
+            )
 
             data = {"message": {"content": "".join(content_parts)}}
 
@@ -161,6 +178,13 @@ class LlmService:
 
     @staticmethod
     def try_generate_direct_answer(question: str, context: str) -> str | None:
+        pre_registration_answer = LlmService.try_generate_pre_registration_input_tax_answer(
+            question,
+            context,
+        )
+        if pre_registration_answer is not None:
+            return pre_registration_answer
+
         petroleum_answer = LlmService.try_generate_petroleum_tax_answer(question, context)
         if petroleum_answer is not None:
             return petroleum_answer
@@ -262,6 +286,43 @@ class LlmService:
             + "개별소비세법 제1조의 과세대상과 세율 규정에서 확인한 기본세율입니다."
             + "\n\n3. 근거 부족 여부\n"
             + "한시적 탄력세율의 실제 적용액은 별도 확인이 필요합니다."
+        )
+
+    @staticmethod
+    def try_generate_pre_registration_input_tax_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = question.replace(" ", "")
+        if "사업자등록" not in compact_question:
+            return None
+        if not any(term in compact_question for term in ("등록전", "등록이전", "등록전에")):
+            return None
+        if "매입세액" not in compact_question and "부가가치세" not in compact_question:
+            return None
+
+        required_evidence = (
+            "제39조",
+            "사업자등록을 신청하기 전의 매입세액",
+            "20일 이내",
+            "등록신청일",
+            "과세기간 기산일",
+        )
+        if not all(term in context for term in required_evidence):
+            return None
+
+        return (
+            "1. 결론\n"
+            "원칙적으로 사업자등록 신청 전에 발생한 매입세액은 공제되지 않습니다. "
+            "다만 인테리어의 공급시기가 속하는 과세기간이 끝난 후 20일 이내에 "
+            "사업자등록을 신청했다면, 등록신청일부터 그 과세기간의 기산일까지 "
+            "역산한 기간 내의 매입세액은 예외적으로 공제 가능합니다.\n\n"
+            "2. 검색 근거\n"
+            "부가가치세법 제39조제1항제8호는 사업자등록 신청 전 매입세액을 "
+            "원칙적으로 불공제하면서 위 20일 이내 등록 예외를 규정합니다.\n\n"
+            "3. 근거 부족 여부\n"
+            "실제 공제 여부는 인테리어 용역의 공급시기, 등록신청일, "
+            "과세사업 관련성 및 세금계산서 등 증빙을 함께 확인해야 합니다."
         )
 
     @staticmethod

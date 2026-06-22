@@ -210,6 +210,12 @@ class ChunkSearchService:
         "프로판", "부탄", "천연가스", "유연탄",
     ]
 
+    PRE_REGISTRATION_INPUT_TAX_QUERY_HINTS = [
+        "부가가치세법", "제39조", "제1항제8호", "공제하지 아니하는 매입세액",
+        "사업자등록을 신청하기 전", "공급시기", "과세기간", "20일 이내",
+        "등록신청일", "과세기간 기산일",
+    ]
+
     PARTICLE_SUFFIXES = (
         "으로부터", "에서", "으로", "에게", "한테", "까지", "부터",
         "처럼", "보다", "마저", "조차", "이라도", "라도", "이나",
@@ -277,6 +283,12 @@ class ChunkSearchService:
         if self.is_petroleum_tax_question(question, expanded_keywords):
             expanded_keywords = self.prepend_unique(
                 self.PETROLEUM_TAX_QUERY_HINTS,
+                expanded_keywords,
+            )
+
+        if self.is_pre_registration_input_tax_question(question, expanded_keywords):
+            expanded_keywords = self.prepend_unique(
+                self.PRE_REGISTRATION_INPUT_TAX_QUERY_HINTS,
                 expanded_keywords,
             )
 
@@ -516,6 +528,21 @@ class ChunkSearchService:
         has_petroleum = any(term in search_text for term in cls.PETROLEUM_TAX_TERMS)
         return has_excise_tax and has_petroleum
 
+    @classmethod
+    def is_pre_registration_input_tax_question(
+        cls,
+        question: str,
+        keywords: list[str] | None = None,
+    ) -> bool:
+        search_text = " ".join([question, *(keywords or [])])
+        compact_text = search_text.replace(" ", "")
+        has_registration = "사업자등록" in compact_text
+        has_before = any(term in compact_text for term in ("등록전", "등록이전", "등록전에", "신청하기전"))
+        has_input_tax = "매입세액" in compact_text or (
+            "부가가치세" in compact_text and "공제" in compact_text
+        )
+        return has_registration and has_before and has_input_tax
+
     @staticmethod
     def prepend_unique(priority_values: list[str], values: list[str]) -> list[str]:
         return ChunkSearchService.deduplicate_keep_order(priority_values + values)
@@ -656,6 +683,26 @@ class ChunkSearchService:
             law_names = cls.prepend_unique(
                 ["개별소비세법", "개별소비세법 시행령"],
                 conditions["law_names"],
+            )
+
+        if cls.is_pre_registration_input_tax_question(
+            conditions["original_question"],
+            conditions["keywords"],
+        ):
+            law_names = cls.prepend_unique(
+                ["부가가치세법", "부가가치세법 시행령"],
+                conditions["law_names"],
+            )
+            supplemental_conditions.append(
+                {
+                    "law_names": law_names,
+                    "keywords": cls.PRE_REGISTRATION_INPUT_TAX_QUERY_HINTS,
+                    "rewritten_query": (
+                        "부가가치세법 제39조 제1항제8호 "
+                        "사업자등록을 신청하기 전 매입세액 "
+                        "공급시기 과세기간 20일 이내 등록신청일"
+                    ),
+                }
             )
             supplemental_conditions.append(
                 {
@@ -959,6 +1006,10 @@ class ChunkSearchService:
             query_text,
             keywords,
         )
+        has_pre_registration_input_tax = ChunkSearchService.is_pre_registration_input_tax_question(
+            query_text,
+            keywords,
+        )
 
         scored: list[tuple[float, LawChunk]] = []
 
@@ -993,6 +1044,24 @@ class ChunkSearchService:
                     score += 80.0
                 score += fuel_matches * 12.0
                 if "담배" in title_text:
+                    score -= 100.0
+
+            if has_pre_registration_input_tax:
+                combined_text = f"{title_text} {content_text}"
+                has_registration = "사업자등록" in combined_text
+                has_input_tax = "매입세액" in combined_text
+
+                if not (has_registration and has_input_tax):
+                    chunk.score = 0.0
+                    continue
+
+                if "제39조" in title_text:
+                    score += 100.0
+                if "사업자등록을 신청하기 전" in combined_text:
+                    score += 80.0
+                if "20일 이내" in combined_text:
+                    score += 40.0
+                if any(term in title_text for term in ("전환", "재고품", "감가상각자산")):
                     score -= 100.0
 
             for term in query_terms:

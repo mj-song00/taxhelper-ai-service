@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+from collections import OrderedDict
+from copy import deepcopy
+from time import monotonic
 from typing import Any
 
 import httpx
@@ -12,11 +16,55 @@ class ChunkSearchClient:
         chunks_path: str,
         timeout_sec: float,
         precedent_chunks_path: str | None = None,
+        cache_ttl_sec: float = 300.0,
+        cache_max_entries: int = 256,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.chunks_path = chunks_path
         self.precedent_chunks_path = precedent_chunks_path or chunks_path
         self.timeout_sec = timeout_sec
+        self.cache_ttl_sec = cache_ttl_sec
+        self.cache_max_entries = cache_max_entries
+        self._client = httpx.AsyncClient(timeout=timeout_sec)
+        self._cache: OrderedDict[tuple[Any, ...], tuple[float, tuple[list[dict[str, Any]], dict[str, Any]]]] = OrderedDict()
+        self._cache_lock = asyncio.Lock()
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def _get_cached(
+        self,
+        key: tuple[Any, ...],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+        if self.cache_ttl_sec <= 0 or self.cache_max_entries <= 0:
+            return None
+
+        async with self._cache_lock:
+            cached = self._cache.get(key)
+            if cached is None:
+                return None
+
+            cached_at, value = cached
+            if monotonic() - cached_at > self.cache_ttl_sec:
+                self._cache.pop(key, None)
+                return None
+
+            self._cache.move_to_end(key)
+            return deepcopy(value)
+
+    async def _set_cached(
+        self,
+        key: tuple[Any, ...],
+        value: tuple[list[dict[str, Any]], dict[str, Any]],
+    ) -> None:
+        if self.cache_ttl_sec <= 0 or self.cache_max_entries <= 0:
+            return
+
+        async with self._cache_lock:
+            self._cache[key] = (monotonic(), deepcopy(value))
+            self._cache.move_to_end(key)
+            while len(self._cache) > self.cache_max_entries:
+                self._cache.popitem(last=False)
 
     async def fetch_chunks(
         self,
@@ -45,19 +93,32 @@ class ChunkSearchClient:
             params["courtNames"] = court_names
         if case_numbers:
             params["caseNumbers"] = case_numbers
-        async with httpx.AsyncClient(timeout=self.timeout_sec) as client:
-            
-            request = client.build_request("GET", url, params=params)
 
-            print("========== SPRING REQUEST ==========")
-            print(request.url)
-            print("========== SPRING REQUEST END ==========")
+        cache_key = (
+            url,
+            candidate_page,
+            candidate_size,
+            tuple(keywords),
+            rewritten_query,
+            tuple(law_names or ()),
+            tuple(court_names or ()),
+            tuple(case_numbers or ()),
+        )
+        cached = await self._get_cached(cache_key)
+        if cached is not None:
+            print(f"[SEARCH_CACHE] hit url={url}", flush=True)
+            return cached
 
+        print(f"[SEARCH_CACHE] miss url={url}", flush=True)
+        request = self._client.build_request("GET", url, params=params)
 
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
+        print("========== SPRING REQUEST ==========")
+        print(request.url)
+        print("========== SPRING REQUEST END ==========")
 
+        response = await self._client.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
         raw_chunks = self._extract_chunk_list(data)
         pagination = self._extract_pagination(
             data,
@@ -65,8 +126,14 @@ class ChunkSearchClient:
             requested_size=candidate_size,
         )
         if raw_chunks is None:
-            return [], pagination
-        return [item for item in raw_chunks if isinstance(item, dict)], pagination
+            result = ([], pagination)
+        else:
+            result = (
+                [item for item in raw_chunks if isinstance(item, dict)],
+                pagination,
+            )
+        await self._set_cached(cache_key, result)
+        return result
 
     @staticmethod
     def _extract_chunk_list(data: Any) -> list[Any] | None:

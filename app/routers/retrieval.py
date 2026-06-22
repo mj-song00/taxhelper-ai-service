@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import httpx
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.core.config import get_settings
 from app.schemas.retrieval import (
@@ -43,6 +43,8 @@ def get_chunk_search_service() -> ChunkSearchService:
         chunks_path=settings.spring_chunks_path,
         precedent_chunks_path=settings.spring_precedent_chunks_path,
         timeout_sec=settings.request_timeout_sec,
+        cache_ttl_sec=settings.search_cache_ttl_sec,
+        cache_max_entries=settings.search_cache_max_entries,
     )
     return ChunkSearchService(
         client=client,
@@ -58,6 +60,8 @@ def get_precedent_search_service() -> PrecedentSearchService:
         chunks_path=settings.spring_chunks_path,
         precedent_chunks_path=settings.spring_precedent_chunks_path,
         timeout_sec=settings.request_timeout_sec,
+        cache_ttl_sec=settings.search_cache_ttl_sec,
+        cache_max_entries=settings.search_cache_max_entries,
     )
     return PrecedentSearchService(
         client=client,
@@ -73,11 +77,12 @@ def get_llm_service() -> LlmService:
 @router.post("/chat", response_model=ChatResponse)
 async def chat_with_llm(
     request: ChatRequest,
+    http_request: Request,
     law_service: ChunkSearchService = Depends(get_chunk_search_service),
     precedent_service: PrecedentSearchService = Depends(get_precedent_search_service),
     llm_service: LlmService = Depends(get_llm_service),
 ) -> ChatResponse:
-    request_id = uuid4().hex[:8]
+    request_id = getattr(http_request.state, "request_id", uuid4().hex[:8])
     total_started_at = perf_counter()
     print(
         f"[CHAT_TIMING] request_id={request_id} phase=request_started "
