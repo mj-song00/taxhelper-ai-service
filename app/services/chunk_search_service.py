@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import re
 
 from app.schemas.retrieval import LawChunk, Pagination
 from app.services.chunk_client import ChunkSearchClient
+from app.services.legal_concepts import (
+    build_weighted_terms,
+    extract_legal_concepts,
+    infer_required_roles,
+)
 
 
 class ChunkSearchService:
@@ -12,6 +18,12 @@ class ChunkSearchService:
         "부가가치세": ["부가가치세법", "부가가치세법 시행령", "부가가치세법 시행규칙"],
         "법인세": ["법인세법", "법인세법 시행령", "법인세법 시행규칙"],
         "개별소비세": ["개별소비세법", "개별소비세법 시행령", "개별소비세법 시행규칙"],
+        "지방세": [
+            "지방세법",
+            "지방세법 시행령",
+            "지방세특례제한법",
+            "지방세특례제한법 시행령",
+        ],
     }
 
     DOMAIN_HINTS = {
@@ -37,6 +49,10 @@ class ChunkSearchService:
             "유종별", "석유류", "휘발유", "경유", "등유", "중유", "프로판",
             "부탄", "액화석유가스", "LPG", "천연가스", "유연탄", "세율",
         },
+        "지방세": {
+            "지방세", "취득세", "재산세", "등록면허세", "지방세감면",
+            "지방세특례", "감면세액", "추징", "유예기간", "직접사용",
+        },
     }
 
     TAX_KEYWORDS = {
@@ -51,6 +67,8 @@ class ChunkSearchService:
         "대손충당금", "대손금", "대손", "채권", "구상채권", "가지급금", "채무보증",
         "해외주식", "미국주식", "외국주식", "국외주식", "주식", "매매차익", "양도차익",
         "배당소득", "금융소득", "국외자산", "양도소득세",
+        "지방세", "취득세", "재산세", "등록면허세", "지방세감면",
+        "지방세특례", "감면세액", "추징", "유예기간", "직접사용",
     }
 
     TAX_SYNONYMS = {
@@ -221,6 +239,7 @@ class ChunkSearchService:
         "처럼", "보다", "마저", "조차", "이라도", "라도", "이나",
         "나", "은", "는", "이", "가", "을", "를", "의", "에",
         "와", "과", "도",
+        "로",
     )
 
     ENDING_SUFFIXES = (
@@ -240,6 +259,9 @@ class ChunkSearchService:
 
     def build_search_conditions(self, question: str) -> dict:
         keywords = self.extract_keywords(question)
+        concepts = extract_legal_concepts(question)
+        keyword_weights = build_weighted_terms(concepts)
+        required_roles = infer_required_roles(concepts)
 
         # 사용자가 `개별 소비세`로 띄어 써도 법령명은 하나의
         # 검색어로 보존한다.
@@ -292,13 +314,31 @@ class ChunkSearchService:
                 expanded_keywords,
             )
 
-        keywords = expanded_keywords[:20]
+        concept_keywords = [
+            term
+            for term, weight in sorted(
+                keyword_weights.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            if weight >= 4.0 or len(concepts) >= 2
+        ]
+        keywords = self.deduplicate_keep_order(
+            concept_keywords + expanded_keywords
+        )[:24]
 
         tax_domain = self.infer_tax_domain(keywords)
 
         law_names = self.extract_law_names(question)
         if not law_names:
             law_names = self.infer_law_names(tax_domain)
+        concept_law_hints = self.deduplicate_keep_order([
+            law_name
+            for concept in concepts
+            for law_name in concept.get("law_hints", [])
+        ])
+        if concept_law_hints:
+            law_names = self.prepend_unique(concept_law_hints, law_names)
 
         article_numbers = self.extract_article_numbers(question)
         intent = self.detect_intent(question)
@@ -319,6 +359,9 @@ class ChunkSearchService:
             "tax_domain": tax_domain,
             "action": action,
             "keywords": keywords,
+            "concepts": concepts,
+            "keyword_weights": keyword_weights,
+            "required_roles": required_roles,
             "law_names": law_names,
             "article_numbers": article_numbers,
             "rewritten_query": rewritten_query,
@@ -336,24 +379,32 @@ class ChunkSearchService:
         print("law_names =", conditions["law_names"])
 
 
-        raw_chunks, page_info = await self.client.fetch_chunks(
-            candidate_page=1,
-            candidate_size=self.candidate_size,
-            law_names=conditions["law_names"],
-            keywords=conditions["keywords"],
-            rewritten_query=conditions["rewritten_query"],
-        )
+        supplemental_conditions = self.build_supplemental_conditions(conditions)
+        search_requests = [
+            self.client.fetch_chunks(
+                candidate_page=1,
+                candidate_size=self.candidate_size,
+                law_names=conditions["law_names"],
+                keywords=conditions["keywords"],
+                rewritten_query=conditions["rewritten_query"],
+            ),
+            *(
+                self.client.fetch_chunks(
+                    candidate_page=1,
+                    candidate_size=self.candidate_size,
+                    law_names=item["law_names"],
+                    keywords=item["keywords"],
+                    rewritten_query=item["rewritten_query"],
+                )
+                for item in supplemental_conditions
+            ),
+        ]
+        search_results = await asyncio.gather(*search_requests)
+        raw_chunks, page_info = search_results[0]
 
         chunks = [self._to_chunk(item) for item in raw_chunks]
 
-        for supplemental_conditions in self.build_supplemental_conditions(conditions):
-            supplemental_raw_chunks, _ = await self.client.fetch_chunks(
-                candidate_page=1,
-                candidate_size=self.candidate_size,
-                law_names=supplemental_conditions["law_names"],
-                keywords=supplemental_conditions["keywords"],
-                rewritten_query=supplemental_conditions["rewritten_query"],
-            )
+        for supplemental_raw_chunks, _ in search_results[1:]:
             chunks.extend(self._to_chunk(item) for item in supplemental_raw_chunks)
 
         chunks = self.deduplicate_chunks(chunks)
@@ -376,6 +427,20 @@ class ChunkSearchService:
             law_names=conditions["law_names"],
             query_text=conditions["original_question"],
             top_k=top_k,
+            concepts=conditions.get("concepts", []),
+            required_roles=conditions.get("required_roles", []),
+        )
+
+        coverage = self.evaluate_concept_coverage(
+            ranked,
+            conditions.get("concepts", []),
+            conditions.get("required_roles", []),
+        )
+        print(
+            f"[SEARCH_COVERAGE] ratio={coverage['ratio']:.3f} "
+            f"matched_roles={coverage['matched_roles']} "
+            f"missing_roles={coverage['missing_roles']}",
+            flush=True,
         )
 
         page_info["total_elements"] = len(ranked)
@@ -396,6 +461,7 @@ class ChunkSearchService:
         chunks: list[LawChunk],
         max_content_chars: int = 1200,
         keywords: list[str] | None = None,
+        keyword_weights: dict[str, float] | None = None,
     ) -> str:
         if not chunks:
             return "검색된 법령 근거가 없습니다."
@@ -409,6 +475,7 @@ class ChunkSearchService:
                 chunk.content or "",
                 max_content_chars,
                 keywords or [],
+                keyword_weights,
             )
 
             contexts.append(
@@ -425,6 +492,7 @@ class ChunkSearchService:
         text: str,
         max_chars: int,
         keywords: list[str],
+        keyword_weights: dict[str, float] | None = None,
     ) -> str:
         normalized = re.sub(r"\s+", " ", text).strip()
         if len(normalized) <= max_chars:
@@ -437,15 +505,37 @@ class ChunkSearchService:
         ]
         lowered = normalized.lower()
 
-        # 여러 유종이 연속해 나오는 세율표는 휘발유 위치를
-        # 기준으로 잘라야 조문 앞부만 전달되는 문제를 피한다.
-        if all(term in lowered for term in ("휘발유", "경유", "등유")):
-            anchor = lowered.find("휘발유")
-        else:
-            positions = [lowered.find(term) for term in useful_keywords if term in lowered]
-            anchor = min(positions) if positions else 0
+        weights = {
+            keyword.lower(): float((keyword_weights or {}).get(keyword, 1.0))
+            for keyword in useful_keywords
+        }
+        anchors: list[int] = []
+        for term in useful_keywords:
+            search_from = 0
+            while len(anchors) < 300:
+                position = lowered.find(term, search_from)
+                if position < 0:
+                    break
+                anchors.append(position)
+                search_from = position + max(len(term), 1)
 
-        start = max(0, anchor - 120)
+        best_start = 0
+        best_score = -1.0
+        for anchor in anchors or [0]:
+            candidate_start = max(0, anchor - max_chars // 3)
+            candidate_end = min(len(normalized), candidate_start + max_chars)
+            candidate_start = max(0, candidate_end - max_chars)
+            window = lowered[candidate_start:candidate_end]
+            score = sum(
+                weight
+                for term, weight in weights.items()
+                if term in window
+            )
+            if score > best_score:
+                best_score = score
+                best_start = candidate_start
+
+        start = best_start
         end = min(len(normalized), start + max_chars)
         excerpt = normalized[start:end].strip()
 
@@ -567,6 +657,38 @@ class ChunkSearchService:
     def build_supplemental_conditions(cls, conditions: dict) -> list[dict]:
         supplemental_conditions: list[dict] = []
 
+        concepts = conditions.get("concepts", [])
+        required_roles = set(conditions.get("required_roles", []))
+        strict_concepts = [
+            concept
+            for concept in concepts
+            if concept.get("role") in required_roles
+            or concept.get("role") in {"EXCEPTION", "BENEFIT"}
+        ]
+        strict_keywords = cls.deduplicate_keep_order([
+            term
+            for concept in strict_concepts
+            for term in concept.get("search_terms", [])[:2]
+        ])
+        if len(strict_keywords) >= 2:
+            concept_law_names = cls.deduplicate_keep_order([
+                law_name
+                for concept in concepts
+                for law_name in concept.get("law_hints", [])
+            ])
+            strict_law_names = concept_law_names or conditions["law_names"]
+            supplemental_conditions.append(
+                {
+                    "law_names": strict_law_names,
+                    "keywords": strict_keywords,
+                    "rewritten_query": " ".join(
+                        cls.deduplicate_keep_order(
+                            strict_law_names + strict_keywords
+                        )
+                    ),
+                }
+            )
+
         if cls.is_housing_loan_question(
             conditions["original_question"],
             conditions["keywords"],
@@ -684,6 +806,16 @@ class ChunkSearchService:
                 ["개별소비세법", "개별소비세법 시행령"],
                 conditions["law_names"],
             )
+            supplemental_conditions.append(
+                {
+                    "law_names": law_names,
+                    "keywords": cls.PETROLEUM_TAX_QUERY_HINTS,
+                    "rewritten_query": (
+                        "개별소비세법 제1조 과세대상과 세율 석유류 수량 "
+                        "리터당 휘발유 경유 등유 중유 프로판 부탄"
+                    ),
+                }
+            )
 
         if cls.is_pre_registration_input_tax_question(
             conditions["original_question"],
@@ -704,17 +836,6 @@ class ChunkSearchService:
                     ),
                 }
             )
-            supplemental_conditions.append(
-                {
-                    "law_names": law_names,
-                    "keywords": cls.PETROLEUM_TAX_QUERY_HINTS,
-                    "rewritten_query": (
-                        "개별소비세법 제1조 과세대상과 세율 석유류 수량 "
-                        "리터당 휘발유 경유 등유 중유 프로판 부탄"
-                    ),
-                }
-            )
-
         return supplemental_conditions
 
     @staticmethod
@@ -728,6 +849,7 @@ class ChunkSearchService:
             "대상이", "기준", "받으면", "받은경우", "되나요",
             "세금", "내야", "하나요", "나요", "수익",
             "같은",
+            "받은", "받다", "다른", "용도", "사용", "정당한", "정당",
         }
 
         seen: set[str] = set()
@@ -758,10 +880,7 @@ class ChunkSearchService:
             else:
                 general_keywords.append(normalized)
 
-            if len(tax_keywords) + len(general_keywords) >= 8:
-                break
-
-        return (tax_keywords + general_keywords)[:8]
+        return (tax_keywords + general_keywords)[:16]
 
     @staticmethod
     def normalize_search_token(token: str) -> str:
@@ -947,17 +1066,25 @@ class ChunkSearchService:
         law_names: list[str],
         query_text: str,
         top_k: int,
+        concepts: list[dict] | None = None,
+        required_roles: list[str] | None = None,
     ) -> list[LawChunk]:
-        del law_names
+        concepts = concepts or []
+        required_role_set = set(required_roles or [])
+        preferred_law_names = {name.lower() for name in law_names}
 
-        raw_tokens = re.findall(r"[0-9A-Za-z가-힣.%]{2,}", query_text)
+        raw_tokens = ChunkSearchService.extract_keywords(query_text)
 
         query_terms: list[str] = []
         seen: set[str] = set()
 
 
         for token in raw_tokens + keywords:
-            normalized = ChunkSearchService.normalize_search_token(token)
+            normalized = (
+                " ".join(token.split())
+                if " " in token
+                else ChunkSearchService.normalize_search_token(token)
+            )
 
             if len(normalized) < 2:
                 continue
@@ -1065,10 +1192,58 @@ class ChunkSearchService:
                     score -= 100.0
 
             for term in query_terms:
-                title_hits = title_text.count(term)
-                content_hits = content_text.count(term)
+                title_hits = min(title_text.count(term), 2)
+                content_hits = min(content_text.count(term), 3)
 
                 score += (title_hits * 3.0) + content_hits
+
+            combined_text = f"{title_text} {content_text}"
+            matched_roles: set[str] = set()
+            matched_positions: list[int] = []
+
+            for concept in concepts:
+                concept_terms = concept.get("search_terms", [])
+                matched_term = next(
+                    (
+                        term.lower()
+                        for term in concept_terms
+                        if term and term.lower() in combined_text
+                    ),
+                    None,
+                )
+                if matched_term is None:
+                    continue
+
+                role = str(concept.get("role") or "")
+                if role:
+                    matched_roles.add(role)
+                concept_weight = float(concept.get("weight") or 0.0)
+                matched_in_title = matched_term in title_text
+                title_bonus = 2.0 if matched_in_title else 1.0
+                score += concept_weight * title_bonus
+                if matched_in_title and role == "LEGAL_EFFECT":
+                    score += 18.0
+                matched_positions.append(combined_text.find(matched_term))
+
+            matched_required_roles = required_role_set & matched_roles
+            missing_required_roles = required_role_set - matched_roles
+            score += len(matched_required_roles) * 8.0
+            score -= len(missing_required_roles) * 14.0
+
+            if required_role_set and not missing_required_roles:
+                score += 24.0
+
+            if "LEGAL_EFFECT" in required_role_set and "LEGAL_EFFECT" not in matched_roles:
+                score -= 18.0
+            if "BREACH" in required_role_set and "BREACH" not in matched_roles:
+                score -= 15.0
+
+            valid_positions = [position for position in matched_positions if position >= 0]
+            if len(valid_positions) >= 3 and max(valid_positions) - min(valid_positions) <= 1000:
+                score += 15.0
+
+            if (chunk.law_name or "").lower() in preferred_law_names:
+                score += 6.0
 
             if has_three_percent or has_business_income or has_withholding:
                 if "이자소득" in title_text or "배당소득" in title_text:
@@ -1270,6 +1445,40 @@ class ChunkSearchService:
         ]
 
         return ranked[:top_k]
+
+    @staticmethod
+    def evaluate_concept_coverage(
+        chunks: list[LawChunk],
+        concepts: list[dict],
+        required_roles: list[str],
+    ) -> dict:
+        required_role_set = set(required_roles)
+        if not required_role_set:
+            return {
+                "ratio": 1.0,
+                "matched_roles": [],
+                "missing_roles": [],
+            }
+
+        matched_roles: set[str] = set()
+        for chunk in chunks[:3]:
+            text = f"{chunk.title or ''} {chunk.content or ''}".lower()
+            for concept in concepts:
+                role = str(concept.get("role") or "")
+                if role not in required_role_set:
+                    continue
+                if any(
+                    term and term.lower() in text
+                    for term in concept.get("search_terms", [])
+                ):
+                    matched_roles.add(role)
+
+        missing_roles = required_role_set - matched_roles
+        return {
+            "ratio": len(matched_roles) / len(required_role_set),
+            "matched_roles": sorted(matched_roles),
+            "missing_roles": sorted(missing_roles),
+        }
 
     @staticmethod
     def is_deleted_chunk(chunk: LawChunk) -> bool:

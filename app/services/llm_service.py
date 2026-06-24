@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+from collections import OrderedDict
 import json
 import re
-from time import perf_counter
+from time import monotonic, perf_counter
+from typing import AsyncIterator
 
 import httpx
 
@@ -10,6 +13,8 @@ from app.core.config import get_settings
 
 
 class LlmService:
+    PROMPT_VERSION = "2026-06-24-precedent-context-v4"
+
     def __init__(self) -> None:
         settings = get_settings()
         self.base_url = settings.ollama_base_url.rstrip("/")
@@ -18,6 +23,10 @@ class LlmService:
         self.num_predict = settings.ollama_num_predict
         self.num_ctx = settings.ollama_num_ctx
         self.keep_alive = settings.ollama_keep_alive
+        self.answer_cache_ttl_sec = settings.llm_answer_cache_ttl_sec
+        self.answer_cache_max_entries = settings.llm_answer_cache_max_entries
+        self._answer_cache: OrderedDict[tuple[str, str, str], tuple[float, str]] = OrderedDict()
+        self._answer_cache_lock = asyncio.Lock()
         self.timeout = httpx.Timeout(
             connect=10.0,
             read=300.0,
@@ -29,22 +38,78 @@ class LlmService:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def generate_answer(self, question: str, context: str) -> str:
-        url = f"{self.base_url}/api/chat"
+    async def warm_up(self) -> None:
+        """Load the configured model into Ollama before the first user request."""
+        started_at = perf_counter()
+        response = await self._client.post(
+            f"{self.base_url}/api/generate",
+            json={
+                "model": self.model,
+                "prompt": "",
+                "stream": False,
+                "keep_alive": self.keep_alive,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        print(
+            f"[OLLAMA_WARMUP] model={self.model} status=completed "
+            f"elapsed_sec={perf_counter() - started_at:.3f} "
+            f"load_sec={float(data.get('load_duration') or 0) / 1_000_000_000:.3f}",
+            flush=True,
+        )
 
+    async def _get_cached_answer(self, key: tuple[str, str, str]) -> str | None:
+        if self.answer_cache_ttl_sec <= 0 or self.answer_cache_max_entries <= 0:
+            return None
+        async with self._answer_cache_lock:
+            cached = self._answer_cache.get(key)
+            if cached is None:
+                return None
+            cached_at, answer = cached
+            if monotonic() - cached_at > self.answer_cache_ttl_sec:
+                self._answer_cache.pop(key, None)
+                return None
+            self._answer_cache.move_to_end(key)
+            return answer
+
+    async def _set_cached_answer(self, key: tuple[str, str, str], answer: str) -> None:
+        if self.answer_cache_ttl_sec <= 0 or self.answer_cache_max_entries <= 0:
+            return
+        async with self._answer_cache_lock:
+            self._answer_cache[key] = (monotonic(), answer)
+            self._answer_cache.move_to_end(key)
+            while len(self._answer_cache) > self.answer_cache_max_entries:
+                self._answer_cache.popitem(last=False)
+
+    def _build_payload(self, question: str, context: str) -> dict:
         if context is None:
             context = ""
-
         context = context.strip()
-
+        has_precedent_context = (
+            "[판례 근거]" in context
+            and "검색된 판례 근거가 없습니다." not in context
+        )
         if len(context) > self.max_context_chars:
             context = context[:self.max_context_chars]
 
-        direct_answer = self.try_generate_direct_answer(question, context)
-        if direct_answer is not None:
-            return direct_answer
-
-        payload = {
+        if has_precedent_context:
+            source_specific_rules = (
+                "- 판례 존재 여부 질문에서 핵심 쟁점과 일치하는 판례가 제공되면 "
+                "법원·사건번호·선고일과 판결 결론을 쓴다.\n"
+                "- 판례 전문의 당사자 주장과 법원의 판단을 구분하고, "
+                "법원의 판단만 결론으로 사용한다.\n"
+                "- 법원이 무엇을 위법·적법하다고 보았고 처분을 취소·유지했는지 "
+                "반드시 한 문장으로 요약한다.\n"
+            )
+        else:
+            source_specific_rules = (
+                "- 제공된 근거에 판례가 없으므로 법원·판례·사건번호·판결을 언급하지 않는다.\n"
+                "- 법령 질문은 조문이 정한 원칙, 각 호의 서로 다른 요건, 예외를 구분해서 설명한다.\n"
+                "- 질문만으로 구체적인 감면 유형을 확정할 수 없으면 일반규정을 먼저 설명하고 "
+                "개별 감면 조항에 특별규정이 있을 수 있음을 밝힌다.\n"
+            )
+        return {
             "model": self.model,
             "stream": True,
             "think": False,
@@ -61,6 +126,7 @@ class LlmService:
                         "- 금액·기간·조건은 근거에 있는 내용을 빠뜨리지 않는다.\n"
                         "- 관련 없는 조문은 인용하지 않는다.\n"
                         "- 결론에는 질문이 요구한 항목을 실제로 나열하고 조문번호만 쓰지 않는다.\n"
+                        f"{source_specific_rules}"
                         "- 전체 350자 이내로 간결하게 작성한다.\n"
                         "형식:\n1. 결론\n2. 검색 근거(법령명·조문명·사건번호)\n3. 근거 부족 여부"
                     ),
@@ -82,6 +148,35 @@ class LlmService:
                 "num_ctx": self.num_ctx,
             },
         }
+
+    async def generate_answer(self, question: str, context: str) -> str:
+        content_parts = [
+            piece async for piece in self.stream_answer(question=question, context=context)
+        ]
+        return "".join(content_parts)
+
+    async def stream_answer(self, question: str, context: str) -> AsyncIterator[str]:
+        context = (context or "").strip()
+
+        direct_answer = self.try_generate_direct_answer(question, context)
+        if direct_answer is not None:
+            yield direct_answer
+            return
+
+        answer_cache_key = (
+            f"{self.model}:{self.PROMPT_VERSION}",
+            question.strip(),
+            context,
+        )
+        cached_answer = await self._get_cached_answer(answer_cache_key)
+        if cached_answer is not None:
+            print(f"[LLM_CACHE] hit model={self.model}", flush=True)
+            yield cached_answer
+            return
+        print(f"[LLM_CACHE] miss model={self.model}", flush=True)
+
+        payload = self._build_payload(question, context)
+        url = f"{self.base_url}/api/chat"
 
         print("question length =", len(question))
         print("context length =", len(context))
@@ -118,6 +213,7 @@ class LlmService:
                         if first_token_sec is None:
                             first_token_sec = perf_counter() - ollama_started_at
                         content_parts.append(piece)
+                        yield piece
                     if event.get("done") is True:
                         final_event = event
 
@@ -135,14 +231,13 @@ class LlmService:
                 flush=True,
             )
 
-            data = {"message": {"content": "".join(content_parts)}}
-
         except httpx.ReadTimeout:
             print("========== Ollama 호출 실패 ==========")
             print("에러 타입:", httpx.ReadTimeout)
             print("에러 내용: read timeout")
             print("========== Ollama 호출 실패 끝 ==========")
-            return "LLM 응답 시간이 초과되었습니다. 검색 근거를 줄이거나 다시 시도해주세요."
+            yield "LLM 응답 시간이 초과되었습니다. 검색 근거를 줄이거나 다시 시도해주세요."
+            return
 
         except httpx.HTTPStatusError as e:
             print("========== Ollama 호출 실패 ==========")
@@ -150,34 +245,44 @@ class LlmService:
             print("상태 코드:", e.response.status_code)
             print("에러 내용:", e.response.text)
             print("========== Ollama 호출 실패 끝 ==========")
-            return "LLM 서버에서 오류 응답을 반환했습니다."
+            yield "LLM 서버에서 오류 응답을 반환했습니다."
+            return
 
         except httpx.RequestError as e:
             print("========== Ollama 호출 실패 ==========")
             print("에러 타입:", type(e))
             print("에러 내용:", str(e))
             print("========== Ollama 호출 실패 끝 ==========")
-            return "LLM 서버에 연결할 수 없습니다."
+            yield "LLM 서버에 연결할 수 없습니다."
+            return
 
+        content = "".join(content_parts).strip()
         print("========== OLLAMA RESPONSE ==========")
-        print(data)
+        print({"message": {"content": content}})
         print("========== OLLAMA RESPONSE END ==========")
 
-        message = data.get("message", {})
-        content = message.get("content")
-
-        if not isinstance(content, str):
-            return "LLM 응답을 읽을 수 없습니다."
-
-        content = content.strip()
-
         if not content:
-            return "LLM이 빈 응답을 반환했습니다. 검색 근거가 너무 길거나 모델이 답변 생성을 완료하지 못했을 수 있습니다."
+            yield "LLM이 빈 응답을 반환했습니다. 검색 근거가 너무 길거나 모델이 답변 생성을 완료하지 못했을 수 있습니다."
+            return
 
-        return content
+        await self._set_cached_answer(answer_cache_key, content)
 
     @staticmethod
     def try_generate_direct_answer(question: str, context: str) -> str | None:
+        beneficial_owner_answer = LlmService.try_generate_beneficial_owner_dividend_answer(
+            question,
+            context,
+        )
+        if beneficial_owner_answer is not None:
+            return beneficial_owner_answer
+
+        local_tax_clawback_answer = LlmService.try_generate_local_tax_clawback_answer(
+            question,
+            context,
+        )
+        if local_tax_clawback_answer is not None:
+            return local_tax_clawback_answer
+
         pre_registration_answer = LlmService.try_generate_pre_registration_input_tax_answer(
             question,
             context,
@@ -241,6 +346,109 @@ class LlmService:
             "제공된 법령 근거만으로 한도액은 확인됩니다. 다만 실제 적용 여부는 "
             "주택 수, 기준시가, 차입 시기, 상환 방식 등 소득세법 제52조 및 "
             "소득세법 시행령 제112조의 요건 충족 여부를 함께 확인해야 합니다."
+        )
+
+    @staticmethod
+    def try_generate_beneficial_owner_dividend_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = re.sub(r"\s+", "", question)
+        asks_shell_company = any(
+            term in compact_question
+            for term in ("페이퍼컴퍼니", "도관회사", "명목회사")
+        )
+        asks_dividend = "배당" in compact_question
+        asks_owner = any(
+            term in compact_question
+            for term in ("실질귀속", "귀속자", "귀속주체")
+        )
+        if not (asks_shell_company and asks_dividend and asks_owner):
+            return None
+
+        required_basis = (
+            "2014누6236",
+            "현실적으로 귀속",
+            "실질적으로 배당소득",
+            "형식적인 귀속 명의자",
+            "조세회피 목적",
+            "실질귀속자의 지위",
+        )
+        if not all(term in context for term in required_basis):
+            return None
+
+        return (
+            "1. 결론\n"
+            "서울고등법원 2014누6236은 해외 법인 명의만으로 소득 귀속을 정하지 않고, "
+            "소득이 누구에게 현실적으로 귀속되었는지를 소득 항목별로 판단했습니다. 홍콩 법인이 "
+            "BVI 법인에 수수료 명목으로 송금한 돈은 주주에게 현실 귀속되고 실질적으로 배당소득에 "
+            "해당한다고 보아 주주에 대한 종합소득세 과세대상으로 인정했습니다.\n\n"
+            "2. 판단 기준\n"
+            "- 송금 명목과 거래관계가 실제인지\n"
+            "- 소득을 최종적으로 수취·사용한 사람이 누구인지\n"
+            "- 해외 법인이 독립된 거래주체인지, 형식적 명의자에 불과한지\n"
+            "- 법인 설립·거래에 투자 목적과 조세회피 목적 중 무엇이 인정되는지\n"
+            "- 허위 자료나 위장된 거래로 현실 귀속을 은닉했는지\n\n"
+            "3. 검색 근거\n"
+            "서울고등법원 2018. 1. 24. 선고 2014누6236 종합소득세부과처분취소. "
+            "다만 법원은 BVI 법인의 독립성과 투자 목적이 인정되는 다른 소득까지 모두 주주에게 "
+            "귀속시킨 것은 아니므로, 페이퍼컴퍼니라는 사정만으로 일률적으로 판단할 수는 없습니다."
+        )
+
+    @staticmethod
+    def try_generate_local_tax_clawback_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = re.sub(r"\s+", "", question)
+        asks_local_tax = any(
+            term in compact_question
+            for term in ("지방세", "취득세", "재산세")
+        )
+        asks_relief = any(
+            term in compact_question
+            for term in ("감면", "면제", "경감")
+        )
+        asks_property = any(
+            term in compact_question
+            for term in ("부동산", "토지", "건축물", "주택")
+        )
+        asks_clawback_condition = any(
+            term in compact_question
+            for term in ("추징", "다른용도", "용도변경", "직접사용", "유예기간")
+        )
+        if not (
+            asks_local_tax
+            and asks_relief
+            and asks_property
+            and asks_clawback_condition
+        ):
+            return None
+
+        required_basis = (
+            "지방세특례제한법",
+            "제178조",
+            "감면된 취득세",
+            "정당한 사유 없이",
+            "취득일부터 1년",
+            "직접 사용한 기간이 2년 미만",
+            "다른 용도로 사용",
+        )
+        if not all(term in context for term in required_basis):
+            return None
+
+        return (
+            "1. 결론\n"
+            "원칙적으로 추징 대상이 될 수 있지만, '유예기간 내 다른 용도로 사용했다'는 "
+            "사실만으로 언제나 즉시 추징되는 것은 아닙니다. 지방세특례제한법 제178조제1항은 "
+            "① 정당한 사유 없이 취득일부터 1년이 될 때까지 해당 용도로 직접 사용하지 않은 경우와 "
+            "② 해당 용도로 직접 사용한 기간이 2년 미만인 상태에서 다른 용도로 사용한 경우를 "
+            "각각 추징 사유로 정합니다. 실제 사실관계가 어느 요건에 해당하는지 구분해야 합니다.\n\n"
+            "2. 검색 근거\n"
+            "지방세특례제한법 제178조제1항제1호·제2호(감면된 취득세의 추징)\n\n"
+            "3. 추가 확인 사항\n"
+            "적용받은 구체적인 감면 조항에 별도의 추징 규정이 있는지, 취득일, 직접 사용을 시작한 날, "
+            "용도변경일 및 정당한 사유의 존재를 확인해야 최종 판단할 수 있습니다."
         )
 
 

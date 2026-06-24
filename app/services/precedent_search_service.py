@@ -17,6 +17,33 @@ class PrecedentSearchService:
         "SUMMARY": ("판결요지", "요지"),
         "FULL_TEXT": ("판례내용", "전문", "본문"),
     }
+    KEYWORD_EXPANSIONS = {
+        "페이퍼컴퍼니": (
+            "페이퍼 컴퍼니", "도관회사", "도관 법인", "명목회사",
+            "실체 없는 법인", "BVI 법인", "홍콩 법인",
+        ),
+        "실질귀속자": (
+            "실질귀속", "실질적 귀속자", "현실 귀속", "소득의 귀속주체",
+            "지배·관리", "지배ㆍ관리", "관리·처분", "계좌인출권자",
+        ),
+        "배당소득": ("배당금", "배당", "이자 및 배당소득"),
+        "간접비": ("간접비용", "직간접비", "취득 관련 비용"),
+        "과세표준": ("과세표준액", "취득가격", "사실상의 취득가격"),
+    }
+    CRIMINAL_CASE_TERMS = (
+        "형사", "고합", "고단", "횡령", "배임", "조세범처벌법",
+        "특정범죄가중처벌", "특정경제범죄가중처벌", "피고인",
+    )
+    ADMIN_CASE_TERMS = (
+        "부과처분취소", "경정거부처분취소", "과세처분취소",
+        "종합소득세", "법인세", "취득세", "부가가치세", "양도소득세",
+    )
+    SUBSTANTIVE_REASONING_TERMS = (
+        "실질적 귀속자", "실질귀속자", "실질귀속", "현실 귀속",
+        "소득의 귀속주체", "지배·관리", "지배ㆍ관리", "관리·처분",
+        "독립된 거래주체", "형식적인 귀속 명의자", "조세회피 목적",
+        "사실상의 취득가격", "취득가격", "간접비용", "직간접비용",
+    )
 
     COURT_PATTERN = re.compile(
         r"(?:대법원|헌법재판소|조세심판원|고등법원|지방법원|행정법원|특허법원|회생법원|가정법원)"
@@ -49,18 +76,22 @@ class PrecedentSearchService:
             chunk_types=conditions["chunk_types"],
             query_text=conditions["original_question"],
             top_k=len(chunks),
+            concept_groups=conditions.get("concept_groups", []),
+            case_name_hints=conditions.get("case_name_hints", []),
         )
 
         return ranked[:top_k], Pagination(**page_info)
 
     def build_search_conditions(self, question: str) -> dict:
         normalized = " ".join(question.split())
-        keywords = ChunkSearchService.extract_keywords(normalized)
-        tax_domain = ChunkSearchService.infer_tax_domain(keywords)
+        base_keywords = ChunkSearchService.extract_keywords(normalized)
         court_names = self.extract_court_names(normalized)
         case_numbers = self.extract_case_numbers(normalized)
-        chunk_types = self.extract_chunk_types(normalized)
+        chunk_types = self.extract_chunk_types(normalized) or ["ISSUE", "SUMMARY"]
         intent = self.detect_intent(normalized, chunk_types)
+        keywords, concept_groups = self.expand_keywords(normalized, base_keywords)
+        tax_domain = ChunkSearchService.infer_tax_domain(keywords)
+        case_name_hints = self.build_case_name_hints(normalized, tax_domain)
 
         rewritten_query = self.build_rewritten_query(
             keywords=keywords,
@@ -77,6 +108,8 @@ class PrecedentSearchService:
             "court_names": court_names,
             "case_numbers": case_numbers,
             "chunk_types": chunk_types,
+            "concept_groups": concept_groups,
+            "case_name_hints": case_name_hints,
             "rewritten_query": rewritten_query,
             "page": 1,
             "size": self.candidate_size,
@@ -122,25 +155,17 @@ class PrecedentSearchService:
     def build_prompt_context(
         self,
         chunks: list[PrecedentChunk],
-        max_content_chars: int = 800,
+        keywords: list[str] | None = None,
+        max_content_chars: int = 850,
     ) -> str:
         if not chunks:
             return ""
 
         lines: list[str] = []
-        preferred_order = {
-            "ISSUE": 0,
-            "SUMMARY": 1,
-            "REFERENCE_ARTICLE": 2,
-            "REFERENCE_CASE": 3,
-            "FULL_TEXT": 4,
-        }
-        context_chunks = sorted(
-            chunks,
-            key=lambda chunk: preferred_order.get((chunk.chunk_type or "").upper(), 99),
-        )
-
-        for idx, chunk in enumerate(context_chunks, start=1):
+        # retrieve_chunks에서 계산한 관련도 순서를 유지한다. FULL_TEXT라는
+        # 이유만으로 정확히 일치하는 판례가 뒤로 밀리면 전체 컨텍스트
+        # 길이 제한에 걸려 핵심 판시가 사라질 수 있다.
+        for idx, chunk in enumerate(chunks, start=1):
             source = " / ".join(
                 value
                 for value in [
@@ -148,6 +173,7 @@ class PrecedentSearchService:
                     chunk.metadata.get("caseName"),
                     chunk.metadata.get("courtName"),
                     chunk.metadata.get("caseNumber"),
+                    chunk.metadata.get("sentencingDate"),
                     chunk.chunk_type,
                 ]
                 if value
@@ -157,15 +183,101 @@ class PrecedentSearchService:
             lines.append(header)
             if chunk.precedent_id:
                 lines.append(f"precedentId: {chunk.precedent_id}")
-            lines.append(
-                ChunkSearchService.truncate_text(
-                    chunk.content.strip(),
-                    max_content_chars,
-                )
-            )
+            lines.append(self.extract_relevant_excerpt(
+                chunk.content,
+                keywords or [],
+                max_content_chars,
+            ))
             lines.append("")
 
         return "\n".join(lines).strip()
+
+    @staticmethod
+    def extract_relevant_excerpt(
+        text: str,
+        keywords: list[str],
+        max_chars: int,
+    ) -> str:
+        clean_text = re.sub(r"<br\s*/?>", "\n", text or "", flags=re.IGNORECASE)
+        clean_text = re.sub(r"<[^>]+>", " ", clean_text)
+        clean_text = re.sub(r"\s+", " ", clean_text).strip()
+        if len(clean_text) <= max_chars:
+            return clean_text
+
+        query_terms = [
+            term.lower()
+            for term in ChunkSearchService.deduplicate_keep_order(keywords)
+            if len(term) >= 2
+        ]
+        decision_terms = (
+            "세무조사 대상 선정사유",
+            "선정사유가 없음에도",
+            "적법절차의 원칙",
+            "조사권을 남용",
+            "과세처분은 위법",
+            "부과처분을 취소",
+            "처분은 위법",
+            "취소되어야",
+            "위법하다고 봄이 타당",
+            "원고의 위 주장은 이유 있다",
+            "따라서 이 사건 처분",
+            "청구는 이유 있어 이를 인용",
+            "주문과 같이 판결",
+        )
+        lowered = clean_text.lower()
+        anchors: list[int] = []
+        for term in [*query_terms, *decision_terms]:
+            start = 0
+            while len(anchors) < 300:
+                position = lowered.find(term.lower(), start)
+                if position < 0:
+                    break
+                anchors.append(position)
+                start = position + max(len(term), 1)
+
+        if not anchors:
+            return ChunkSearchService.truncate_text(clean_text, max_chars)
+
+        window_chars = max_chars if max_chars < 800 else max(350, (max_chars - 30) // 2)
+        scored_windows: dict[int, float] = {}
+        for anchor in anchors:
+            start = max(0, anchor - window_chars // 3)
+            end = min(len(clean_text), start + window_chars)
+            start = max(0, end - window_chars)
+            window = lowered[start:end]
+            query_score = sum(6 for term in query_terms if term in window)
+            substantive_score = sum(
+                36
+                for term in PrecedentSearchService.SUBSTANTIVE_REASONING_TERMS
+                if term in window
+            )
+            # Generic disposition phrases occur in nearly every judgment and
+            # must not outweigh issue-specific legal concepts.
+            decision_score = sum(8 for term in decision_terms if term in window)
+            score = query_score + substantive_score + decision_score
+            scored_windows[start] = max(scored_windows.get(start, -1), score)
+
+        selected_starts: list[int] = []
+        max_windows = 2 if max_chars >= 800 else 1
+        for start, _ in sorted(
+            scored_windows.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            if any(abs(start - selected) < window_chars for selected in selected_starts):
+                continue
+            selected_starts.append(start)
+            if len(selected_starts) >= max_windows:
+                break
+
+        excerpts: list[str] = []
+        for index, start in enumerate(selected_starts, start=1):
+            excerpt = clean_text[start:start + window_chars].strip()
+            prefix = "…" if start > 0 else ""
+            suffix = "…" if start + window_chars < len(clean_text) else ""
+            label = f"[핵심 근거 {index}] " if max_windows > 1 else ""
+            excerpts.append(f"{label}{prefix}{excerpt}{suffix}")
+        return "\n".join(excerpts)
 
     @staticmethod
     def extract_court_names(question: str) -> list[str]:
@@ -223,22 +335,60 @@ class PrecedentSearchService:
 
         return " ".join(ChunkSearchService.deduplicate_keep_order(query_terms))
 
+    @classmethod
+    def expand_keywords(
+        cls,
+        question: str,
+        base_keywords: list[str],
+    ) -> tuple[list[str], list[list[str]]]:
+        compact_question = re.sub(r"\s+", "", question).lower()
+        expanded = list(base_keywords)
+        concept_groups: list[list[str]] = []
+
+        for trigger, synonyms in cls.KEYWORD_EXPANSIONS.items():
+            if trigger.replace(" ", "").lower() not in compact_question:
+                continue
+            group = [trigger, *synonyms]
+            concept_groups.append(group)
+            expanded.extend(synonyms)
+
+        return ChunkSearchService.deduplicate_keep_order(expanded)[:30], concept_groups
+
     @staticmethod
+    def build_case_name_hints(question: str, tax_domain: str) -> list[str]:
+        hints = ["부과처분취소"]
+        compact = re.sub(r"\s+", "", question)
+        if "취득세" in compact:
+            hints = ["취득세부과처분취소", "취득세등부과처분취소", *hints]
+        elif "배당소득" in compact or tax_domain == "소득세":
+            hints = ["종합소득세부과처분취소", *hints]
+        elif tax_domain == "법인세":
+            hints = ["법인세부과처분취소", "법인세등부과처분취소", *hints]
+        return ChunkSearchService.deduplicate_keep_order(hints)
+
+    @classmethod
     def rank_chunks(
+        cls,
         chunks: list[PrecedentChunk],
         keywords: list[str],
         chunk_types: list[str],
         query_text: str,
         top_k: int,
+        concept_groups: list[list[str]] | None = None,
+        case_name_hints: list[str] | None = None,
     ) -> list[PrecedentChunk]:
-        del keywords
-
-        raw_tokens = re.findall(r"[0-9A-Za-z가-힣]{2,}", query_text)
+        concept_groups = concept_groups or []
+        case_name_hints = case_name_hints or []
+        raw_tokens = [*ChunkSearchService.extract_keywords(query_text), *keywords]
         query_terms: list[str] = []
         seen: set[str] = set()
 
         for token in raw_tokens:
-            normalized = ChunkSearchService.normalize_search_token(token)
+            normalized = (
+                " ".join(token.split())
+                if " " in token
+                else ChunkSearchService.normalize_search_token(token)
+            )
 
             if len(normalized) < 2 or ChunkSearchService.is_unwanted_verb(normalized):
                 continue
@@ -263,11 +413,17 @@ class PrecedentSearchService:
             title_text = (chunk.title or "").lower()
             content_text = (chunk.content or "").lower()
             chunk_type_text = (chunk.chunk_type or "").lower()
+            case_name_text = str(chunk.metadata.get("caseName") or "").lower()
+            court_name_text = str(chunk.metadata.get("courtName") or "").lower()
+            case_number_text = str(chunk.metadata.get("caseNumber") or "").lower()
+            searchable_text = " ".join(
+                [title_text, content_text, case_name_text, court_name_text, case_number_text]
+            )
 
             score = 0.0
 
             for term in query_terms:
-                title_hits = title_text.count(term)
+                title_hits = title_text.count(term) + case_name_text.count(term)
                 content_hits = content_text.count(term)
                 # 긴 FULL_TEXT가 단순 반복 횟수로 상위를 독점하지
                 # 못하도록 용어별 횟수를 제한한다.
@@ -276,17 +432,45 @@ class PrecedentSearchService:
             matched_terms = sum(
                 1
                 for term in query_terms
-                if term in title_text or term in content_text
+                if term in searchable_text
             )
 
             overlap_ratio = matched_terms / len(query_terms)
             score += overlap_ratio * 10.0
 
-            if (chunk.chunk_type or "").upper() == "FULL_TEXT":
-                score -= 4.0
+            chunk_type_upper = (chunk.chunk_type or "").upper()
+            if chunk_type_upper == "ISSUE":
+                score += 18.0
+            elif chunk_type_upper == "SUMMARY":
+                score += 14.0
+            elif chunk_type_upper == "FULL_TEXT":
+                score -= 6.0
+
+            if any(hint.lower() in case_name_text for hint in case_name_hints):
+                score += 22.0
+            elif any(term in case_name_text for term in cls.ADMIN_CASE_TERMS):
+                score += 10.0
+
+            criminal_text = f"{case_name_text} {case_number_text}"
+            if any(term.lower() in criminal_text for term in cls.CRIMINAL_CASE_TERMS):
+                score -= 45.0
+
+            matched_groups = sum(
+                1
+                for group in concept_groups
+                if any(term.lower() in searchable_text for term in group)
+            )
+            group_ratio = (
+                matched_groups / len(concept_groups)
+                if concept_groups
+                else 1.0
+            )
+            score += matched_groups * 12.0
+            if concept_groups and group_ratio == 1.0:
+                score += 20.0
 
             # 질의 핵심 용어의 40%도 맞지 않으면 관련 판례로 보지 않는다.
-            if overlap_ratio < 0.40:
+            if overlap_ratio < 0.20 or group_ratio < 0.50:
                 chunk.score = 0.0
                 scored.append((0.0, chunk))
                 continue

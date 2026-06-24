@@ -1,3 +1,4 @@
+import httpx
 from time import perf_counter
 from uuid import uuid4
 
@@ -84,6 +85,18 @@ def create_app() -> FastAPI:
     @app.on_event("shutdown")
     async def shutdown_search_clients() -> None:
         await close_search_clients()
+
+    @app.on_event("startup")
+    async def warm_up_ollama_model() -> None:
+        try:
+            await get_llm_service().warm_up()
+        except (httpx.HTTPError, ValueError) as exc:
+            # Keep the API available when Ollama is temporarily unavailable.
+            # The normal request path will surface a useful LLM error response.
+            print(
+                f"[OLLAMA_WARMUP] status=failed error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     return app
 

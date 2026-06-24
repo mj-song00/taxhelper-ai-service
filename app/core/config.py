@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     ollama_num_predict: int = Field(default=220, ge=64, le=1000)
     ollama_num_ctx: int = Field(default=4096, ge=2048, le=32_768)
     ollama_keep_alive: str = "30m"
+    llm_answer_cache_ttl_sec: float = Field(default=3600.0, ge=0)
+    llm_answer_cache_max_entries: int = Field(default=256, ge=0, le=10_000)
 
     # openai_api_key: str
     # openai_model: str = "gpt-5.5"
