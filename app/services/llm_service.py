@@ -13,7 +13,7 @@ from app.core.config import get_settings
 
 
 class LlmService:
-    PROMPT_VERSION = "2026-06-24-precedent-context-v4"
+    PROMPT_VERSION = "2026-07-06-grounded-context-v7"
 
     def __init__(self) -> None:
         settings = get_settings()
@@ -90,6 +90,15 @@ class LlmService:
             "[판례 근거]" in context
             and "검색된 판례 근거가 없습니다." not in context
         )
+        compact_question = re.sub(r"\s+", "", question)
+        is_special_relation_fee_question = (
+            any(term in compact_question for term in ("특수관계인", "특수관계자"))
+            and "수수료" in compact_question
+            and any(
+                term in compact_question
+                for term in ("부당행위계산", "필요경비", "손금", "부인")
+            )
+        )
         if len(context) > self.max_context_chars:
             context = context[:self.max_context_chars]
 
@@ -109,6 +118,16 @@ class LlmService:
                 "- 질문만으로 구체적인 감면 유형을 확정할 수 없으면 일반규정을 먼저 설명하고 "
                 "개별 감면 조항에 특별규정이 있을 수 있음을 밝힌다.\n"
             )
+        transaction_direction_rules = ""
+        if is_special_relation_fee_question:
+            transaction_direction_rules = (
+                "- 이 질문의 거래 방향은 질문자가 특수관계인에게 수수료를 지급하고 "
+                "그 대가로 용역을 제공받은 경우다. 질문자가 용역을 무상·저가로 "
+                "제공한 경우로 바꾸어 답하지 않는다.\n"
+                "- 지급 수수료는 실제 용역 및 경제적 대가관계가 있는지, "
+                "건전한 사회통념·상관행과 독립 당사자 간 정상거래의 시가에 비추어 "
+                "경제적 합리성이 있는지를 중심으로 설명한다.\n"
+            )
         return {
             "model": self.model,
             "stream": True,
@@ -123,12 +142,19 @@ class LlmService:
                         "규칙:\n"
                         "- 제공된 법령·판례 근거만 사용하고 추론하지 않는다.\n"
                         "- 직접 근거가 없으면 '제공된 근거만으로는 판단할 수 없습니다.'라고 쓴다.\n"
+                        "- 질문이 일반적인 판단 기준을 묻고 검색 근거가 그 기준을 제시하면, "
+                        "구체적 사실관계가 없다는 이유만으로 판단 불가라고 하지 않는다.\n"
                         "- 금액·기간·조건은 근거에 있는 내용을 빠뜨리지 않는다.\n"
                         "- 관련 없는 조문은 인용하지 않는다.\n"
+                        "- 지급자·수령자, 제공자·제공받는 자와 고가·저가의 거래 방향을 바꾸지 않는다.\n"
+                        "- 사건번호·선고일·조문번호는 검색 근거의 값을 한 글자도 바꾸지 않고 옮긴다.\n"
                         "- 결론에는 질문이 요구한 항목을 실제로 나열하고 조문번호만 쓰지 않는다.\n"
                         f"{source_specific_rules}"
+                        f"{transaction_direction_rules}"
                         "- 전체 350자 이내로 간결하게 작성한다.\n"
-                        "형식:\n1. 결론\n2. 검색 근거(법령명·조문명·사건번호)\n3. 근거 부족 여부"
+                        "형식:\n1. 결론\n2. 검색 근거(법령명·조문명·사건번호)\n"
+                        "3. 근거의 범위(일반 판단 기준의 근거가 있으면 "
+                        "'일반 판단 기준에 관한 근거는 충분함'이라고 쓴다)"
                     ),
                 },
                 {

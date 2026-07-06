@@ -172,6 +172,27 @@ class ChunkSearchService:
         "제61조",
     ]
 
+    SPECIAL_RELATION_FEE_TERMS = {
+        "특수관계인", "특수관계자", "계열회사", "수수료", "용역비",
+        "필요경비", "손금", "부당행위계산", "부당행위계산부인",
+    }
+
+    SPECIAL_RELATION_FEE_QUERY_HINTS = [
+        "부당행위계산의 부인",
+        "특수관계인",
+        "특수관계인으로부터",
+        "높은 이율",
+        "제공받는 경우",
+        "경제적 합리성",
+        "건전한 사회통념",
+        "상관행",
+        "시가",
+        "용역",
+        "수수료",
+        "필요경비",
+        "제98조",
+    ]
+
     BUSINESS_WITHHOLDING_TERMS = {
         "3.3", "3.3%", "프리랜서", "사업소득", "원천징수", "종합소득세", "종소세",
     }
@@ -287,6 +308,12 @@ class ChunkSearchService:
         if self.is_bad_debt_allowance_question(question, expanded_keywords):
             expanded_keywords = self.prepend_unique(
                 self.BAD_DEBT_ALLOWANCE_QUERY_HINTS,
+                expanded_keywords,
+            )
+
+        if self.is_special_relation_fee_question(question, expanded_keywords):
+            expanded_keywords = self.prepend_unique(
+                self.SPECIAL_RELATION_FEE_QUERY_HINTS,
                 expanded_keywords,
             )
 
@@ -495,6 +522,30 @@ class ChunkSearchService:
         keyword_weights: dict[str, float] | None = None,
     ) -> str:
         normalized = re.sub(r"\s+", " ", text).strip()
+        # 수수료 지급자는 특수관계인에게 용역을 제공하는 쪽이 아니라
+        # 용역을 제공받는 쪽이다. 제98조 전체를 그대로 주면 소형 모델이
+        # 제2호(무상·저가 제공)와 제3호(고가 제공받음)를 뒤집기 쉬우므로
+        # 공통요건과 거래 방향이 맞는 각 호만 원문 그대로 발췌한다.
+        if (
+            "특수관계인으로부터" in keywords
+            and "제98조(부당행위계산의 부인)" in normalized
+            and "3. 특수관계인으로부터" in normalized
+        ):
+            first_item = normalized.find("1.")
+            third_item = normalized.find("3. 특수관계인으로부터")
+            fourth_item = normalized.find("4.", third_item)
+            fifth_item = normalized.find("5.", fourth_item)
+            third_end = fourth_item if fourth_item > third_item else len(normalized)
+            fifth_end = normalized.find("③", fifth_item)
+            if fifth_end < 0:
+                fifth_end = len(normalized)
+            relevant_parts = [
+                normalized[:first_item].strip() if first_item > 0 else "",
+                normalized[third_item:third_end].strip(),
+                normalized[fifth_item:fifth_end].strip() if fifth_item > 0 else "",
+            ]
+            return " ".join(part for part in relevant_parts if part)
+
         if len(normalized) <= max_chars:
             return normalized
 
@@ -574,6 +625,34 @@ class ChunkSearchService:
         search_text = " ".join([question, *(keywords or [])])
 
         return any(term in search_text for term in cls.BAD_DEBT_ALLOWANCE_TERMS)
+
+    @classmethod
+    def is_special_relation_fee_question(
+        cls,
+        question: str,
+        keywords: list[str] | None = None,
+    ) -> bool:
+        search_text = " ".join([question, *(keywords or [])])
+        compact_text = re.sub(r"\s+", "", search_text)
+        has_special_relation = any(
+            term in compact_text
+            for term in ("특수관계인", "특수관계자", "계열회사")
+        )
+        has_fee_or_service = any(
+            term in compact_text
+            for term in ("수수료", "용역비", "용역", "대가")
+        )
+        has_denial_issue = any(
+            term in compact_text
+            for term in (
+                "부당행위계산",
+                "필요경비",
+                "손금",
+                "부인",
+                "불산입",
+            )
+        )
+        return has_special_relation and has_fee_or_service and has_denial_issue
 
     @classmethod
     def is_business_withholding_question(
@@ -749,6 +828,41 @@ class ChunkSearchService:
                         "법인세법 제34조 제19조의2 법인세법 시행령 제61조 "
                         "대손충당금 손금산입 설정대상채권 채권잔액 "
                         "채무보증 구상채권 특수관계인 업무와 관련 없이 가지급금 제외"
+                    ),
+                }
+            )
+
+        if cls.is_special_relation_fee_question(
+            conditions["original_question"],
+            conditions["keywords"],
+        ):
+            uses_corporate_tax = any(
+                term in conditions["original_question"]
+                for term in ("법인세", "손금", "법인")
+            )
+            law_names = (
+                ["법인세법", "법인세법 시행령"]
+                if uses_corporate_tax
+                else ["소득세법", "소득세법 시행령"]
+            )
+            article_hints = (
+                ["제52조", "제88조", "제89조"]
+                if uses_corporate_tax
+                else ["제41조", "제98조"]
+            )
+            keywords = cls.prepend_unique(
+                article_hints + cls.SPECIAL_RELATION_FEE_QUERY_HINTS,
+                conditions["keywords"],
+            )
+            supplemental_conditions.append(
+                {
+                    "law_names": cls.prepend_unique(
+                        law_names,
+                        conditions["law_names"],
+                    ),
+                    "keywords": keywords,
+                    "rewritten_query": " ".join(
+                        cls.deduplicate_keep_order(law_names + keywords)
                     ),
                 }
             )
@@ -1121,6 +1235,10 @@ class ChunkSearchService:
             query_text,
             keywords,
         )
+        has_special_relation_fee = ChunkSearchService.is_special_relation_fee_question(
+            query_text,
+            keywords,
+        )
         has_business_withholding = ChunkSearchService.is_business_withholding_question(
             query_text,
             keywords,
@@ -1300,6 +1418,40 @@ class ChunkSearchService:
 
                 if "손금산입" in combined_text or "채권잔액" in combined_text or "설정대상채권" in combined_text:
                     score += 18.0
+
+            if has_special_relation_fee:
+                combined_text = f"{title_text} {content_text}"
+                uses_corporate_tax = any(
+                    term in query_text
+                    for term in ("법인세", "손금", "법인")
+                )
+                if uses_corporate_tax:
+                    is_target_article = (
+                        "법인세법 시행령" in (chunk.law_name or "")
+                        and any(term in title_text for term in ("제88조", "제89조"))
+                    )
+                else:
+                    is_target_article = (
+                        "소득세법 시행령" in (chunk.law_name or "")
+                        and "제98조" in title_text
+                        and "부당행위계산" in title_text
+                    )
+
+                if is_target_article:
+                    score += 120.0
+                if "부당행위계산" in combined_text:
+                    score += 35.0
+                if "특수관계인" in combined_text or "특수관계자" in combined_text:
+                    score += 25.0
+                if "용역" in combined_text:
+                    score += 20.0
+                if "시가" in combined_text:
+                    score += 15.0
+
+                # 양도자산 취득가액이나 일반 필요경비 조문은 보조 근거일
+                # 뿐, 부당행위계산 부인의 직접 기준 조문보다 앞설 수 없다.
+                if "제163조" in title_text or "제55조" in title_text:
+                    score -= 45.0
 
             if has_business_withholding:
                 combined_text = f"{title_text} {content_text}"

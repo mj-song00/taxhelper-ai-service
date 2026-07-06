@@ -29,6 +29,15 @@ class PrecedentSearchService:
         "배당소득": ("배당금", "배당", "이자 및 배당소득"),
         "간접비": ("간접비용", "직간접비", "취득 관련 비용"),
         "과세표준": ("과세표준액", "취득가격", "사실상의 취득가격"),
+        "특수관계인": (
+            "특수관계자", "계열회사", "이익을 분여", "조세의 부담을 부당하게 감소",
+        ),
+        "부당행위계산": (
+            "부당행위계산부인", "경제적 합리성", "건전한 사회통념", "상관행",
+        ),
+        "수수료": (
+            "거래수수료", "용역비", "용역", "대가관계", "정상가격", "시가",
+        ),
     }
     CRIMINAL_CASE_TERMS = (
         "형사", "고합", "고단", "횡령", "배임", "조세범처벌법",
@@ -43,6 +52,9 @@ class PrecedentSearchService:
         "소득의 귀속주체", "지배·관리", "지배ㆍ관리", "관리·처분",
         "독립된 거래주체", "형식적인 귀속 명의자", "조세회피 목적",
         "사실상의 취득가격", "취득가격", "간접비용", "직간접비용",
+        "부당행위계산", "경제적 합리성", "건전한 사회통념", "상관행",
+        "정상적인 거래", "정상가격", "시가", "실제 용역", "대가관계",
+        "이익을 분여", "조세의 부담을 부당하게 감소", "특수관계인",
     )
 
     COURT_PATTERN = re.compile(
@@ -407,6 +419,12 @@ class PrecedentSearchService:
             return chunks[:top_k]
 
         preferred_types = {chunk_type.upper() for chunk_type in chunk_types}
+        compact_query = re.sub(r"\s+", "", query_text)
+        is_special_relation_fee_question = (
+            any(term in compact_query for term in ("특수관계인", "특수관계자"))
+            and "수수료" in compact_query
+            and "부당행위계산" in compact_query
+        )
         scored: list[tuple[float, PrecedentChunk]] = []
 
         for chunk in chunks:
@@ -450,6 +468,28 @@ class PrecedentSearchService:
                 score += 22.0
             elif any(term in case_name_text for term in cls.ADMIN_CASE_TERMS):
                 score += 10.0
+
+            if is_special_relation_fee_question:
+                reasoning_positions: list[int] = []
+                search_from = 0
+                while True:
+                    position = content_text.find("경제적 합리성", search_from)
+                    if position < 0:
+                        break
+                    reasoning_positions.append(position)
+                    search_from = position + 1
+                has_application_reasoning = any(
+                    "지급" in content_text[max(0, position - 1200):position + 1200]
+                    and any(
+                        term in content_text[max(0, position - 1200):position + 1200]
+                        for term in ("수수료", "용역비")
+                    )
+                    for position in reasoning_positions
+                )
+                if has_application_reasoning:
+                    score += 35.0
+                else:
+                    score -= 20.0
 
             criminal_text = f"{case_name_text} {case_number_text}"
             if any(term.lower() in criminal_text for term in cls.CRIMINAL_CASE_TERMS):

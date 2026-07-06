@@ -1,7 +1,9 @@
+from dataclasses import dataclass
 from functools import lru_cache
 import json
 import re
 from time import perf_counter
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -12,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from app.core.config import get_settings
 from app.schemas.retrieval import (
     ChatRequest,
+    ChatResponse,
 )
 from app.services.chunk_client import ChunkSearchClient
 from app.services.chunk_search_service import ChunkSearchService
@@ -91,42 +94,128 @@ def compact_chunk(
     data = chunk.model_dump(mode="json")
     original_content = str(data.get("content") or "")
     content = content_preview if content_preview is not None else original_content
+    original_preview = re.sub(
+        r"<br\s*/?>",
+        "\n",
+        original_content,
+        flags=re.IGNORECASE,
+    )
+    original_preview = re.sub(r"<[^>]+>", " ", original_preview)
+    original_preview = re.sub(r"\s+", " ", original_preview).strip()
     preview = re.sub(r"<br\s*/?>", "\n", content, flags=re.IGNORECASE)
     preview = re.sub(r"<[^>]+>", " ", preview)
     preview = re.sub(r"\s+", " ", preview).strip()
-    truncated = content_preview is not None or len(preview) > max_content_chars
-    data["content"] = (
-        f"{preview[:max_content_chars].rstrip()}…" if truncated else preview
+    response_truncated = len(preview) > max_content_chars
+    source_truncated = (
+        content_preview is not None
+        and preview != original_preview
     )
-    data["content_truncated"] = truncated
+    data["content"] = (
+        f"{preview[:max_content_chars].rstrip()}…"
+        if response_truncated
+        else preview
+    )
+    data["content_truncated"] = source_truncated or response_truncated
     return data
 
 
-@router.post(
-    "/chat",
-    response_class=StreamingResponse,
-    responses={
-        200: {
-            "content": {"text/event-stream": {}},
-            "description": "Token stream. Events: metadata, token, done.",
-        }
-    },
-)
-async def chat_with_llm(
-    request: ChatRequest,
-    http_request: Request,
-    law_service: ChunkSearchService = Depends(get_chunk_search_service),
-    precedent_service: PrecedentSearchService = Depends(get_precedent_search_service),
-    llm_service: LlmService = Depends(get_llm_service),
-) -> StreamingResponse:
-    request_id = getattr(http_request.state, "request_id", uuid4().hex[:8])
-    total_started_at = perf_counter()
-    print(
-        f"[CHAT_TIMING] request_id={request_id} phase=request_started "
-        f"question_chars={len(request.question)} top_k={request.top_k}",
-        flush=True,
-    )
+def build_sources(
+    law_chunks: list[dict],
+    precedent_chunks: list[dict],
+) -> list[dict]:
+    sources: list[dict] = []
 
+    for chunk in law_chunks:
+        sources.append(
+            {
+                "source_type": "law",
+                "chunk_id": chunk["chunk_id"],
+                "law_name": chunk.get("law_name"),
+                "title": chunk.get("title") or chunk.get("article"),
+                "excerpt": chunk.get("content") or "",
+                "content_truncated": bool(chunk.get("content_truncated")),
+                "full_content_available": bool(chunk.get("content_truncated")),
+                "score": chunk.get("score"),
+            }
+        )
+
+    for chunk in precedent_chunks:
+        metadata = chunk.get("metadata") or {}
+        sources.append(
+            {
+                "source_type": "precedent",
+                "chunk_id": chunk["chunk_id"],
+                "precedent_id": chunk.get("precedent_id"),
+                "title": chunk.get("title"),
+                "court_name": metadata.get("courtName"),
+                "case_number": metadata.get("caseNumber"),
+                "case_name": metadata.get("caseName"),
+                "sentencing_date": metadata.get("sentencingDate"),
+                "excerpt": chunk.get("content") or "",
+                "content_truncated": bool(chunk.get("content_truncated")),
+                "full_content_available": bool(chunk.get("content_truncated")),
+                "score": chunk.get("score"),
+            }
+        )
+
+    return sources
+
+
+def select_answer_sources(answer: str, sources: list[dict]) -> list[dict]:
+    """Keep only sources explicitly cited by the generated answer."""
+    article_counts: dict[str, int] = {}
+    for source in sources:
+        if source.get("source_type") != "law":
+            continue
+        article_match = re.search(r"제\d+조(?:의\d+)?", source.get("title") or "")
+        if article_match:
+            article = article_match.group()
+            article_counts[article] = article_counts.get(article, 0) + 1
+
+    selected: list[dict] = []
+    for source in sources:
+        source_type = source.get("source_type")
+        if source_type == "precedent":
+            case_number = str(source.get("case_number") or "").strip()
+            if case_number and case_number in answer:
+                selected.append(source)
+            continue
+
+        if source_type != "law":
+            continue
+
+        law_name = str(source.get("law_name") or "").strip()
+        title = str(source.get("title") or "").strip()
+        article_match = re.search(r"제\d+조(?:의\d+)?", title)
+        article = article_match.group() if article_match else ""
+        if title and title in answer:
+            selected.append(source)
+        elif (
+            article
+            and article in answer
+            and (law_name in answer or article_counts.get(article) == 1)
+        ):
+            selected.append(source)
+
+    return selected
+
+
+@dataclass
+class PreparedChat:
+    context: str
+    law_chunk_data: list[dict]
+    precedent_chunk_data: list[dict]
+    law_chunks: list[Any]
+    precedent_chunks: list[Any]
+
+
+async def prepare_chat(
+    request: ChatRequest,
+    request_id: str,
+    total_started_at: float,
+    law_service: ChunkSearchService,
+    precedent_service: PrecedentSearchService,
+) -> PreparedChat:
     law_search_conditions = law_service.build_search_conditions(request.question)
     precedent_search_conditions = precedent_service.build_search_conditions(request.question)
 
@@ -147,7 +236,7 @@ async def chat_with_llm(
             phase_started_at = perf_counter()
             precedent_chunks, _ = await precedent_service.retrieve_chunks(
                 conditions=precedent_search_conditions,
-                top_k=min(request.top_k, 3),
+                top_k=min(request.top_k, 5),
             )
             log_chat_timing(
                 request_id,
@@ -184,16 +273,18 @@ async def chat_with_llm(
         ) from exc
 
     if precedent_chunks:
+        context_precedent_chunks = precedent_chunks[:2]
+        context_law_chunks = law_chunks[:1]
         # 판례 질문에서는 판례 근거가 전역 컨텍스트 제한에 잘리지 않도록
-        # 판례를 먼저 배치하고 법령은 가장 관련도 높은 한 건만 보조한다.
+        # 판례를 먼저 배치하되 직접 기준 조문도 함께 제공한다.
         precedent_context = precedent_service.build_prompt_context(
-            precedent_chunks[:2],
+            context_precedent_chunks,
             keywords=precedent_search_conditions["keywords"],
-            max_content_chars=950,
+            max_content_chars=700,
         )
         law_context = law_service.build_prompt_context(
-            law_chunks[:1],
-            max_content_chars=450,
+            context_law_chunks,
+            max_content_chars=950,
             keywords=law_search_conditions["keywords"],
             keyword_weights=law_search_conditions.get("keyword_weights"),
         )
@@ -202,24 +293,181 @@ async def chat_with_llm(
             f"[법령 근거]\n{law_context}"
         ).strip()
     else:
+        context_precedent_chunks = []
+        context_law_chunks = law_chunks
         context = (
             "[법령 근거]\n"
             f"{law_service.build_prompt_context(law_chunks, keywords=law_search_conditions['keywords'], keyword_weights=law_search_conditions.get('keyword_weights'))}\n\n"
             "[판례 근거]\n검색된 판례 근거가 없습니다."
         ).strip()
 
-    law_chunk_data = [compact_chunk(chunk) for chunk in law_chunks]
+    # 응답에 표시하는 검색 근거와 실제 LLM 프롬프트 근거를 일치시킨다.
+    law_chunk_data = [
+        compact_chunk(
+            chunk,
+            max_content_chars=1000,
+            content_preview=law_service.extract_relevant_excerpt(
+                chunk.content,
+                950,
+                law_search_conditions["keywords"],
+                law_search_conditions.get("keyword_weights"),
+            ),
+        )
+        for chunk in context_law_chunks
+    ]
     precedent_chunk_data = [
         compact_chunk(
             chunk,
+            max_content_chars=1250,
             content_preview=precedent_service.extract_relevant_excerpt(
                 chunk.content,
                 precedent_search_conditions["keywords"],
-                500,
+                1200,
             ),
         )
+        for chunk in context_precedent_chunks
+    ]
+
+    return PreparedChat(
+        context=context,
+        law_chunk_data=law_chunk_data,
+        precedent_chunk_data=precedent_chunk_data,
+        law_chunks=law_chunks,
+        precedent_chunks=context_precedent_chunks,
+    )
+
+
+def build_citation_suffix(answer: str, precedent_chunks: list[Any]) -> str:
+    negative_answer_markers = (
+        "판례가 없습니다",
+        "판단할 수 없습니다",
+        "근거가 없습니다",
+    )
+    if not precedent_chunks or any(
+        marker in answer for marker in negative_answer_markers
+    ):
+        return ""
+
+    cited_case_numbers = [
+        str(chunk.metadata.get("caseNumber") or "").strip()
         for chunk in precedent_chunks
     ]
+    if any(
+        case_number and case_number in answer
+        for case_number in cited_case_numbers
+    ):
+        return ""
+
+    primary_metadata = precedent_chunks[0].metadata
+    case_number = str(primary_metadata.get("caseNumber") or "").strip()
+    if not case_number or case_number in answer:
+        return ""
+
+    citation_values = [
+        primary_metadata.get("courtName"),
+        primary_metadata.get("sentencingDate"),
+        case_number,
+        primary_metadata.get("caseName"),
+    ]
+    citation = " / ".join(str(value) for value in citation_values if value)
+    return f"\n\n검색 근거: {citation}" if citation else ""
+
+
+def build_chat_response(question: str, answer: str, prepared: PreparedChat) -> ChatResponse:
+    sources = select_answer_sources(
+        answer,
+        build_sources(
+            prepared.law_chunk_data,
+            prepared.precedent_chunk_data,
+        ),
+    )
+    return ChatResponse(
+        question=question,
+        answer=answer,
+        sources=sources,
+    )
+
+
+def start_chat_request(http_request: Request, request: ChatRequest) -> tuple[str, float]:
+    request_id = getattr(http_request.state, "request_id", uuid4().hex[:8])
+    total_started_at = perf_counter()
+    print(
+        f"[CHAT_TIMING] request_id={request_id} phase=request_started "
+        f"question_chars={len(request.question)} top_k={request.top_k}",
+        flush=True,
+    )
+    return request_id, total_started_at
+
+
+@router.post(
+    "/chat",
+    response_model=ChatResponse,
+    summary="Generate a complete chat answer",
+)
+async def chat_with_llm(
+    request: ChatRequest,
+    http_request: Request,
+    law_service: ChunkSearchService = Depends(get_chunk_search_service),
+    precedent_service: PrecedentSearchService = Depends(get_precedent_search_service),
+    llm_service: LlmService = Depends(get_llm_service),
+) -> ChatResponse:
+    request_id, total_started_at = start_chat_request(http_request, request)
+    prepared = await prepare_chat(
+        request,
+        request_id,
+        total_started_at,
+        law_service,
+        precedent_service,
+    )
+    llm_started_at = perf_counter()
+    answer = await llm_service.generate_answer(
+        question=request.question,
+        context=prepared.context,
+    )
+    answer = (answer + build_citation_suffix(answer, prepared.precedent_chunks)).strip()
+    response = build_chat_response(request.question, answer, prepared)
+    log_chat_timing(
+        request_id,
+        "request_completed",
+        total_started_at,
+        law_chunk_count=len(prepared.law_chunks),
+        precedent_chunk_count=len(prepared.precedent_chunks),
+    )
+    log_chat_timing(
+        request_id,
+        "llm_completed",
+        llm_started_at,
+        answer_chars=len(answer),
+    )
+    return response
+
+
+@router.post(
+    "/chat/stream",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "content": {"text/event-stream": {}},
+            "description": "Token stream. Events: metadata, token, done.",
+        }
+    },
+    summary="Stream chat answer tokens",
+)
+async def stream_chat_with_llm(
+    request: ChatRequest,
+    http_request: Request,
+    law_service: ChunkSearchService = Depends(get_chunk_search_service),
+    precedent_service: PrecedentSearchService = Depends(get_precedent_search_service),
+    llm_service: LlmService = Depends(get_llm_service),
+) -> StreamingResponse:
+    request_id, total_started_at = start_chat_request(http_request, request)
+    prepared = await prepare_chat(
+        request,
+        request_id,
+        total_started_at,
+        law_service,
+        precedent_service,
+    )
 
     async def event_stream():
         answer_parts: list[str] = []
@@ -230,15 +478,15 @@ async def chat_with_llm(
             {
                 "request_id": request_id,
                 "question": request.question,
-                "law_chunk_count": len(law_chunk_data),
-                "precedent_chunk_count": len(precedent_chunk_data),
+                "law_chunk_count": len(prepared.law_chunk_data),
+                "precedent_chunk_count": len(prepared.precedent_chunk_data),
             },
         )
 
         try:
             async for piece in llm_service.stream_answer(
                 question=request.question,
-                context=context,
+                context=prepared.context,
             ):
                 answer_parts.append(piece)
                 yield encode_sse("token", {"content": piece})
@@ -255,32 +503,16 @@ async def chat_with_llm(
             )
             return
 
-        current_answer = "".join(answer_parts)
-        negative_answer_markers = (
-            "판례가 없습니다",
-            "판단할 수 없습니다",
-            "근거가 없습니다",
+        citation_piece = build_citation_suffix(
+            "".join(answer_parts),
+            prepared.precedent_chunks,
         )
-        if precedent_chunks and not any(
-            marker in current_answer for marker in negative_answer_markers
-        ):
-            primary_metadata = precedent_chunks[0].metadata
-            case_number = str(primary_metadata.get("caseNumber") or "").strip()
-            if case_number and case_number not in current_answer:
-                citation_values = [
-                    primary_metadata.get("courtName"),
-                    primary_metadata.get("sentencingDate"),
-                    case_number,
-                    primary_metadata.get("caseName"),
-                ]
-                citation = " / ".join(
-                    str(value) for value in citation_values if value
-                )
-                citation_piece = f"\n\n검색 근거: {citation}"
-                answer_parts.append(citation_piece)
-                yield encode_sse("token", {"content": citation_piece})
+        if citation_piece:
+            answer_parts.append(citation_piece)
+            yield encode_sse("token", {"content": citation_piece})
 
         answer = "".join(answer_parts).strip()
+        response = build_chat_response(request.question, answer, prepared)
         log_chat_timing(
             request_id,
             "llm_completed",
@@ -289,29 +521,14 @@ async def chat_with_llm(
         )
         yield encode_sse(
             "done",
-            {
-                "question": request.question,
-                "answer": answer,
-                "law_chunks": law_chunk_data,
-                "precedent_chunks": precedent_chunk_data,
-                "chunks": [
-                    *(
-                        {"chunk_id": chunk["chunk_id"], "source_type": "law"}
-                        for chunk in law_chunk_data
-                    ),
-                    *(
-                        {"chunk_id": chunk["chunk_id"], "source_type": "precedent"}
-                        for chunk in precedent_chunk_data
-                    ),
-                ],
-            },
+            response.model_dump(mode="json"),
         )
         log_chat_timing(
             request_id,
             "request_completed",
             total_started_at,
-            law_chunk_count=len(law_chunks),
-            precedent_chunk_count=len(precedent_chunks),
+            law_chunk_count=len(prepared.law_chunks),
+            precedent_chunk_count=len(prepared.precedent_chunks),
         )
 
     return StreamingResponse(
