@@ -11,6 +11,14 @@ class PrecedentSearchService:
     PRECEDENT_REQUEST_TERMS = (
         "판례", "판결", "판시사항", "판결요지", "사건번호",
         "대법원", "고등법원", "지방법원", "행정법원", "조세심판원",
+        "심판례", "재결례", "결정례",
+    )
+    CASE_LOOKUP_TERMS = (
+        "사례", "선례", "취소된사례", "변경된사례", "인정된사례",
+        "취소사례", "변경사례", "인용사례", "기각사례",
+    )
+    REPRESENTATIVE_BONUS_OUTFLOW_TERMS = (
+        "대표자", "상여", "사외유출", "귀속불분명", "갑종근로소득세",
     )
     CHUNK_TYPE_HINTS = {
         "ISSUE": ("판시사항", "쟁점"),
@@ -37,6 +45,18 @@ class PrecedentSearchService:
         ),
         "수수료": (
             "거래수수료", "용역비", "용역", "대가관계", "정상가격", "시가",
+        ),
+        "대표자상여": (
+            "대표자 상여", "인정상여", "상여처분", "대표자 인정상여",
+            "대표이사", "갑종근로소득세",
+        ),
+        "소득처분": (
+            "소득 처분", "사외유출", "귀속불분명", "귀속이 불분명",
+            "법인세법 시행령 제106조", "익금산입",
+        ),
+        "자금유출": (
+            "자금 유출", "법인자금", "횡령", "인출", "유출금",
+            "손해배상채권", "회수",
         ),
     }
     CRIMINAL_CASE_TERMS = (
@@ -99,9 +119,21 @@ class PrecedentSearchService:
         base_keywords = ChunkSearchService.extract_keywords(normalized)
         court_names = self.extract_court_names(normalized)
         case_numbers = self.extract_case_numbers(normalized)
-        chunk_types = self.extract_chunk_types(normalized) or ["ISSUE", "SUMMARY"]
-        intent = self.detect_intent(normalized, chunk_types)
+        requested_chunk_types = self.extract_chunk_types(normalized)
+        chunk_types = requested_chunk_types or ["ISSUE", "SUMMARY"]
+        intent = self.detect_intent(normalized, requested_chunk_types)
         keywords, concept_groups = self.expand_keywords(normalized, base_keywords)
+
+        if self.is_representative_bonus_outflow_question(normalized):
+            keywords = list(self.REPRESENTATIVE_BONUS_OUTFLOW_TERMS)
+            concept_groups = [
+                ["대표자", "대표이사"],
+                ["상여", "인정상여", "상여처분"],
+                ["사외유출", "유출"],
+                ["귀속불분명", "귀속이 불분명"],
+                ["갑종근로소득세", "갑종근로소득세등부과처분취소"],
+            ]
+
         tax_domain = ChunkSearchService.infer_tax_domain(keywords)
         case_name_hints = self.build_case_name_hints(normalized, tax_domain)
 
@@ -124,7 +156,9 @@ class PrecedentSearchService:
             "case_name_hints": case_name_hints,
             "rewritten_query": rewritten_query,
             "page": 1,
-            "size": self.candidate_size,
+            "size": min(self.candidate_size, 10)
+            if self.is_representative_bonus_outflow_question(normalized)
+            else self.candidate_size,
         }
 
     @classmethod
@@ -137,7 +171,9 @@ class PrecedentSearchService:
         compact = re.sub(r"\s+", "", question)
         if cls.extract_case_numbers(question):
             return True
-        return any(term in compact for term in cls.PRECEDENT_REQUEST_TERMS)
+        if any(term in compact for term in cls.PRECEDENT_REQUEST_TERMS):
+            return True
+        return any(term in compact for term in cls.CASE_LOOKUP_TERMS)
 
     @staticmethod
     def build_search_prompt(question: str, conditions: dict) -> str:
@@ -315,6 +351,23 @@ class PrecedentSearchService:
         return chunk_types
 
     @staticmethod
+    def is_representative_bonus_outflow_question(question: str) -> bool:
+        compact = re.sub(r"\s+", "", question)
+        has_bonus_disposition = (
+            "대표자상여" in compact
+            or ("대표자" in compact and "상여" in compact)
+            or "인정상여" in compact
+            or "상여처분" in compact
+        )
+        has_outflow = (
+            "사외유출" in compact
+            or "자금유출" in compact
+            or "소득처분" in compact
+            or "귀속불분명" in compact
+        )
+        return has_bonus_disposition and has_outflow
+
+    @staticmethod
     def detect_intent(question: str, chunk_types: list[str]) -> str:
         lowered = question.lower()
 
@@ -324,7 +377,11 @@ class PrecedentSearchService:
         if "SUMMARY" in chunk_types or "판결요지" in lowered:
             return "판결요지 확인"
 
+        compact = re.sub(r"\s+", "", question)
         if any(key in lowered for key in ("유사", "관련 판례", "판례")):
+            return "유사 판례 검색"
+
+        if any(term in compact for term in PrecedentSearchService.CASE_LOOKUP_TERMS):
             return "유사 판례 검색"
 
         if any(key in lowered for key in ("요건", "성립", "충족")):
@@ -376,6 +433,8 @@ class PrecedentSearchService:
             hints = ["종합소득세부과처분취소", *hints]
         elif tax_domain == "법인세":
             hints = ["법인세부과처분취소", "법인세등부과처분취소", *hints]
+        if "대표자상여" in compact or "갑종근로소득세" in compact:
+            hints = ["갑종근로소득세등부과처분취소", *hints]
         return ChunkSearchService.deduplicate_keep_order(hints)
 
     @classmethod
