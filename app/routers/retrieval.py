@@ -18,6 +18,7 @@ from app.schemas.retrieval import (
 )
 from app.services.chunk_client import ChunkSearchClient
 from app.services.chunk_search_service import ChunkSearchService
+from app.services.embedding_service import EmbeddingService
 from app.services.llm_service import LlmService
 from app.services.precedent_search_service import PrecedentSearchService
 
@@ -41,6 +42,11 @@ def log_chat_timing(
 
 
 @lru_cache
+def get_embedding_service() -> EmbeddingService:
+    return EmbeddingService()
+
+
+@lru_cache
 def get_chunk_search_service() -> ChunkSearchService:
     settings = get_settings()
     client = ChunkSearchClient(
@@ -54,6 +60,7 @@ def get_chunk_search_service() -> ChunkSearchService:
     return ChunkSearchService(
         client=client,
         candidate_size=settings.default_candidate_size,
+        embedding_service=get_embedding_service(),
     )
 
 
@@ -71,6 +78,7 @@ def get_precedent_search_service() -> PrecedentSearchService:
     return PrecedentSearchService(
         client=client,
         candidate_size=settings.default_candidate_size,
+        embedding_service=get_embedding_service(),
     )
 
 
@@ -151,6 +159,9 @@ def build_sources(
                 "case_number": metadata.get("caseNumber"),
                 "case_name": metadata.get("caseName"),
                 "sentencing_date": metadata.get("sentencingDate"),
+                "case_conclusion_hint": infer_precedent_conclusion_hint(
+                    chunk.get("content") or "",
+                ),
                 "excerpt": chunk.get("content") or "",
                 "content_truncated": bool(chunk.get("content_truncated")),
                 "full_content_available": bool(chunk.get("content_truncated")),
@@ -159,6 +170,21 @@ def build_sources(
         )
 
     return sources
+
+
+def infer_precedent_conclusion_hint(text: str) -> str | None:
+    compact = re.sub(r"\s+", "", text or "")
+    if "조세조약적용을부인할수있는지여부(적극)" in compact:
+        return "조약 혜택 부인 가능 / 과세 가능"
+    if "명의에따른조세조약적용을부인" in compact and "과세한다" in compact:
+        return "조약 혜택 부인 가능 / 과세 가능"
+    if "적용을부인할수있다" in compact and "과세한다" in compact:
+        return "조약 혜택 부인 가능 / 과세 가능"
+    if "과세처분은위법" in compact or "처분이위법" in compact:
+        return "과세처분 위법"
+    if "제한세율이적용" in compact or "제한세율을적용" in compact:
+        return "조약 혜택 인정 / 제한세율 적용"
+    return None
 
 
 def select_answer_sources(answer: str, sources: list[dict]) -> list[dict]:
@@ -374,13 +400,16 @@ def build_citation_suffix(answer: str, precedent_chunks: list[Any]) -> str:
 
 
 def build_chat_response(question: str, answer: str, prepared: PreparedChat) -> ChatResponse:
+    all_sources = build_sources(
+        prepared.law_chunk_data,
+        prepared.precedent_chunk_data,
+    )
     sources = select_answer_sources(
         answer,
-        build_sources(
-            prepared.law_chunk_data,
-            prepared.precedent_chunk_data,
-        ),
+        all_sources,
     )
+    if not sources:
+        sources = all_sources[: max(1, min(len(all_sources), 5))]
     return ChatResponse(
         question=question,
         answer=answer,

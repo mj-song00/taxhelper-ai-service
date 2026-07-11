@@ -104,6 +104,8 @@ class LlmService:
 
         if has_precedent_context:
             source_specific_rules = (
+                "- 판례 답변은 반드시 '일반 법리'와 '해당 사건 결론'을 분리한다. "
+                "서로 결론이 달라 보이면 일반 법리를 먼저 쓰고, 그 사건에서의 결론을 따로 쓴다.\n"
                 "- 판례 존재 여부 질문에서 핵심 쟁점과 일치하는 판례가 제공되면 "
                 "법원·사건번호·선고일과 판결 결론을 쓴다.\n"
                 "- 판례 전문의 당사자 주장과 법원의 판단을 구분하고, "
@@ -152,7 +154,10 @@ class LlmService:
                         f"{source_specific_rules}"
                         f"{transaction_direction_rules}"
                         "- 전체 350자 이내로 간결하게 작성한다.\n"
-                        "형식:\n1. 결론\n2. 검색 근거(법령명·조문명·사건번호)\n"
+                        "판례 근거가 있으면 형식:\n"
+                        "1. 일반 법리\n2. 해당 사건 결론\n3. 이유\n"
+                        "판례 근거가 없으면 형식:\n"
+                        "1. 결론\n2. 검색 근거(법령명·조문명·사건번호)\n"
                         "3. 근거의 범위(일반 판단 기준의 근거가 있으면 "
                         "'일반 판단 기준에 관한 근거는 충분함'이라고 쓴다)"
                     ),
@@ -295,6 +300,15 @@ class LlmService:
 
     @staticmethod
     def try_generate_direct_answer(question: str, context: str) -> str | None:
+        treaty_beneficial_owner_answer = (
+            LlmService.try_generate_treaty_beneficial_owner_denial_answer(
+                question,
+                context,
+            )
+        )
+        if treaty_beneficial_owner_answer is not None:
+            return treaty_beneficial_owner_answer
+
         beneficial_owner_answer = LlmService.try_generate_beneficial_owner_dividend_answer(
             question,
             context,
@@ -372,6 +386,53 @@ class LlmService:
             "제공된 법령 근거만으로 한도액은 확인됩니다. 다만 실제 적용 여부는 "
             "주택 수, 기준시가, 차입 시기, 상환 방식 등 소득세법 제52조 및 "
             "소득세법 시행령 제112조의 요건 충족 여부를 함께 확인해야 합니다."
+        )
+
+    @staticmethod
+    def try_generate_treaty_beneficial_owner_denial_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = re.sub(r"\s+", "", question)
+        asks_treaty = "조세조약" in compact_question or "조약상" in compact_question
+        asks_owner = "수익적소유자" in compact_question or "실질귀속" in compact_question
+        asks_denial = any(term in compact_question for term in ("제한세율", "적용부인", "부인", "과세"))
+        if not (asks_treaty and asks_owner and asks_denial):
+            return None
+
+        required_basis = (
+            "수익적 소유자",
+            "실질과세",
+        )
+        if not all(term in context for term in required_basis):
+            return None
+        compact_context = re.sub(r"\s+", "", context)
+        has_denial_basis = (
+            "조세조약적용을부인" in compact_context
+            or "적용을부인할수있" in compact_context
+            or "명의에따른조세조약적용을부인" in compact_context
+        )
+        has_tax_basis = "과세" in compact_context or "납세의무자" in compact_context
+        if not (has_denial_basis and has_tax_basis):
+            return None
+
+        case_reference = (
+            "대법원 2018. 11. 15. 선고 2017두33008 판결은 "
+            if "2017두33008" in context
+            else "검색된 판례 근거는 "
+        )
+
+        return (
+            "1. 일반 법리\n"
+            "부인할 수 있습니다. 조세조약상 명의자가 수익적 소유자에 해당하지 않거나, "
+            "수익적 소유자처럼 보이더라도 명의와 실질의 괴리가 조세회피 목적에서 비롯된 "
+            "조약 남용이면 제한세율 적용을 부인하고 실질 귀속자에게 과세할 수 있습니다.\n\n"
+            "2. 해당 사건 결론\n"
+            f"{case_reference}위 일반 법리를 제시한 판례입니다.\n\n"
+            "3. 이유\n"
+            "국세기본법상 실질과세 원칙은 조세조약에도 적용되므로, 명의자가 재산을 "
+            "지배ㆍ관리할 능력이 없고 실질 지배자가 따로 있으며 그 괴리가 조세회피 "
+            "목적에서 비롯되면 명의에 따른 조세조약 적용을 부인하고 과세할 수 있습니다."
         )
 
     @staticmethod

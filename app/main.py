@@ -6,6 +6,7 @@ from fastapi import FastAPI
 
 from app.routers.retrieval import (
     get_chunk_search_service,
+    get_embedding_service,
     get_llm_service,
     get_precedent_search_service,
     router as retrieval_router,
@@ -69,6 +70,8 @@ async def close_search_clients() -> None:
         await get_chunk_search_service().client.close()
     if get_precedent_search_service.cache_info().currsize:
         await get_precedent_search_service().client.close()
+    if get_embedding_service.cache_info().currsize:
+        await get_embedding_service().close()
     if get_llm_service.cache_info().currsize:
         await get_llm_service().close()
 

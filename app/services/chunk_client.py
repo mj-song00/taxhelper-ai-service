@@ -77,6 +77,7 @@ class ChunkSearchClient:
         law_names: list[str] | None = None,
         court_names: list[str] | None = None,
         case_numbers: list[str] | None = None,
+        query_embedding: list[float] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         url = f"{self.base_url}{chunks_path or self.chunks_path}"
         print(f"request url = {url}")
@@ -103,6 +104,7 @@ class ChunkSearchClient:
             tuple(law_names or ()),
             tuple(court_names or ()),
             tuple(case_numbers or ()),
+            tuple(round(value, 6) for value in (query_embedding or ())),
         )
         cached = await self._get_cached(cache_key)
         if cached is not None:
@@ -110,13 +112,10 @@ class ChunkSearchClient:
             return cached
 
         print(f"[SEARCH_CACHE] miss url={url}", flush=True)
-        request = self._client.build_request("GET", url, params=params)
-
-        print("========== SPRING REQUEST ==========")
-        print(request.url)
-        print("========== SPRING REQUEST END ==========")
-
-        response = await self._client.get(url, params=params)
+        if query_embedding:
+            response = await self._post_vector_search(url, params, query_embedding)
+        else:
+            response = await self._get_keyword_search(url, params)
         response.raise_for_status()
         data = response.json()
         raw_chunks = self._extract_chunk_list(data)
@@ -134,6 +133,42 @@ class ChunkSearchClient:
             )
         await self._set_cached(cache_key, result)
         return result
+
+    async def _get_keyword_search(
+        self,
+        url: str,
+        params: dict[str, Any],
+    ) -> httpx.Response:
+        request = self._client.build_request("GET", url, params=params)
+        print("========== SPRING REQUEST ==========")
+        print(request.url)
+        print("========== SPRING REQUEST END ==========")
+        return await self._client.get(url, params=params)
+
+    async def _post_vector_search(
+        self,
+        url: str,
+        params: dict[str, Any],
+        query_embedding: list[float],
+    ) -> httpx.Response:
+        payload = {
+            **params,
+            "vectorSearch": True,
+            "queryEmbedding": query_embedding,
+        }
+        print("========== SPRING VECTOR REQUEST ==========")
+        vector_url = f"{url.rstrip('/')}/search"
+        print(f"POST {vector_url} embedding_dim={len(query_embedding)}")
+        print("========== SPRING VECTOR REQUEST END ==========")
+        response = await self._client.post(vector_url, json=payload)
+        if response.status_code in (400, 404, 405, 415):
+            print(
+                "[VECTOR_SEARCH] Spring endpoint does not support POST vector search; "
+                "falling back to GET keyword search.",
+                flush=True,
+            )
+            return await self._get_keyword_search(url, params)
+        return response
 
     @staticmethod
     def _extract_chunk_list(data: Any) -> list[Any] | None:
