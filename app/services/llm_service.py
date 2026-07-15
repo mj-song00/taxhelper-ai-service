@@ -13,7 +13,7 @@ from app.core.config import get_settings
 
 
 class LlmService:
-    PROMPT_VERSION = "2026-07-06-grounded-context-v7"
+    PROMPT_VERSION = "2026-07-15-grounded-context-v8"
 
     def __init__(self) -> None:
         settings = get_settings()
@@ -184,7 +184,39 @@ class LlmService:
         content_parts = [
             piece async for piece in self.stream_answer(question=question, context=context)
         ]
-        return "".join(content_parts)
+        answer = "".join(content_parts).strip()
+        if self.is_structure_only_answer(answer):
+            return (
+                "1. 결론\n"
+                "검색 근거는 확인했지만 답변 내용이 정상적으로 생성되지 않았습니다. "
+                "대상, 용도, 취득 시기 등 사실관계를 조금 더 구체적으로 입력해 주세요.\n\n"
+                "2. 근거의 범위\n"
+                "제공된 근거만으로 특정 감면 요건을 확정하지 않았습니다."
+            )
+        return answer
+
+    @staticmethod
+    def is_structure_only_answer(answer: str) -> bool:
+        if not answer.strip():
+            return True
+
+        structural_phrases = (
+            "결론",
+            "검색 근거",
+            "법령명",
+            "조문명",
+            "사건번호",
+            "근거의 범위",
+            "일반 판단 기준에 관한 근거는 충분함",
+            "일반 법리",
+            "해당 사건 결론",
+            "이유",
+        )
+        remainder = answer
+        for phrase in structural_phrases:
+            remainder = remainder.replace(phrase, "")
+        remainder = re.sub(r"[\d\s.():·ㆍ,\-]+", "", remainder)
+        return len(remainder) < 12
 
     async def stream_answer(self, question: str, context: str) -> AsyncIterator[str]:
         context = (context or "").strip()
@@ -299,7 +331,62 @@ class LlmService:
         await self._set_cached_answer(answer_cache_key, content)
 
     @staticmethod
+    def try_generate_broad_acquisition_tax_relief_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = re.sub(r"\s+", "", question)
+        if "취득세" not in compact_question or "감면" not in compact_question:
+            return None
+        if not any(term in compact_question for term in ("요건", "조건", "무엇")):
+            return None
+
+        specific_relief_terms = (
+            "생애최초",
+            "출산",
+            "양육",
+            "신혼부부",
+            "임대주택",
+            "사회복지",
+            "평생교육",
+            "농지",
+            "다자녀",
+            "전세사기",
+            "기회발전특구",
+            "인구감소지역",
+            "국가유공자",
+            "장애인",
+            "창업",
+            "기업이전",
+        )
+        if any(term in compact_question for term in specific_relief_terms):
+            return None
+        if "지방세특례제한법" not in context or "지방세 감면 특례의 제한" not in context:
+            return None
+
+        return (
+            "1. 결론\n"
+            "취득세 감면에는 하나의 공통 요건이 있는 것이 아니라, 취득 대상과 목적별로 "
+            "각기 다른 감면 조항이 적용됩니다. 현재 질문만으로는 적용할 감면 유형을 특정할 수 없습니다. "
+            "생애최초 주택, 출산·양육 주택, 임대주택, 사회복지시설 등 어떤 감면을 묻는지와 "
+            "취득자 유형, 부동산 용도, 취득일·가액, 소재지를 알려주세요.\n\n"
+            "2. 검색 근거\n"
+            "지방세특례제한법 제177조 지방세 감면 특례의 제한\n\n"
+            "3. 근거의 범위\n"
+            "개별 감면 유형이 특정되지 않아 구체적인 감면율과 세부 요건은 확정할 수 없습니다."
+        )
+
+    @staticmethod
     def try_generate_direct_answer(question: str, context: str) -> str | None:
+        broad_acquisition_tax_relief_answer = (
+            LlmService.try_generate_broad_acquisition_tax_relief_answer(
+                question,
+                context,
+            )
+        )
+        if broad_acquisition_tax_relief_answer is not None:
+            return broad_acquisition_tax_relief_answer
+
         treaty_beneficial_owner_answer = (
             LlmService.try_generate_treaty_beneficial_owner_denial_answer(
                 question,
