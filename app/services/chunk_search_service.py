@@ -61,6 +61,7 @@ class ChunkSearchService:
         "세액공제", "세액감면", "가산세", "경정청구", "수정신고",
         "과세표준", "필요경비", "신고", "납부", "환급", "공제",
         "감면", "세무조사", "조세특례", "사업소득", "근로소득",
+        "폐업", "재고", "잔존재화", "자기생산ㆍ취득재화", "사업 개시일",
         "양도소득", "인적용역", "지급명세서", "확정신고",
         "개별소비세", "개소세", "유류세", "석유류", "유종별",
         "휘발유", "경유", "등유", "중유", "프로판", "부탄", "세율",
@@ -73,6 +74,16 @@ class ChunkSearchService:
     }
 
     TAX_SYNONYMS = {
+        "공급가액": ["부가가치세 포함", "110분의 100", "110분의 10", "제29조"],
+        "부가가치세 포함": ["공급가액", "110분의 100", "제29조"],
+        "임대료": ["공급가액", "부가가치세 포함", "제29조"],
+        "월세": ["받은 대가", "공급가액", "공급대가", "110분의 100", "부가가치세 포함", "제29조"],
+        "부동산 임대": ["받은 대가", "공급가액", "공급대가", "110분의 100", "부가가치세 포함", "제29조"],
+        "리스": ["자동차의 구입과 임차", "비영업용 소형승용차", "경형승용자동차", "제39조", "제78조"],
+        "사업용 차량": ["자동차의 구입과 임차", "비영업용 소형승용차", "운수업", "자동차판매업", "제39조", "제78조"],
+        "차량": ["자동차의 구입과 임차", "비영업용 소형승용차", "경형승용자동차", "제39조", "제78조"],
+        "폐업": ["남아 있는 재화", "잔존재화", "자기생산ㆍ취득재화", "제10조"],
+        "재고": ["남아 있는 재화", "잔존재화", "자기생산ㆍ취득재화", "폐업"],
         "유종별": ["석유류", "휘발유", "경유", "등유", "중유", "프로판", "부탄"],
         "유종": ["석유류", "휘발유", "경유", "등유", "중유", "프로판", "부탄"],
         "석유류": ["휘발유", "경유", "등유", "중유", "석유가스", "프로판", "부탄"],
@@ -173,6 +184,55 @@ class ChunkSearchService:
         "제61조",
     ]
 
+    EXEMPT_INVOICE_PENALTY_QUERY_HINTS = [
+        "면세사업자 계산서 발급",
+        "계산서 미발급",
+        "지연발급",
+        "계산서합계표",
+        "공급가액의 100분의 2",
+        "공급가액의 100분의 1",
+        "공급가액의 1천분의 5",
+        "제163조",
+        "제81조의10",
+        "제121조",
+        "제75조의8",
+    ]
+
+    CLOSING_INVENTORY_TERMS = {
+        "폐업", "폐업할 때", "남아 있는 재화", "잔존재화", "자기생산ㆍ취득재화",
+        "사업 개시일 이전", "사실상 사업을 시작하지",
+    }
+
+    SIMPLE_TAXPAYER_INVOICE_QUERY_HINTS = [
+        "간이과세자 세금계산서 발급",
+        "영수증 발급",
+        "직전 연도 공급대가",
+        "4천800만원",
+        "1억4백만원",
+        "세금계산서 미발급 가산세",
+        "제32조",
+        "제36조",
+        "제36조의2",
+        "제61조",
+        "제68조의2",
+        "제109조",
+    ]
+
+    RECOGNIZED_INTEREST_QUERY_HINTS = [
+        "가지급금 인정이자",
+        "금전의 대여",
+        "특수관계인",
+        "부당행위계산의 부인",
+        "시가",
+        "가중평균차입이자율",
+        "당좌대출이자율",
+        "가지급금 적수",
+        "365",
+        "제52조",
+        "제88조",
+        "제89조",
+    ]
+
     SPECIAL_RELATION_FEE_TERMS = {
         "특수관계인", "특수관계자", "계열회사", "수수료", "용역비",
         "필요경비", "손금", "부당행위계산", "부당행위계산부인",
@@ -191,6 +251,21 @@ class ChunkSearchService:
         "용역",
         "수수료",
         "필요경비",
+        "제98조",
+    ]
+
+    INCOME_SPLITTING_QUERY_HINTS = [
+        "부당행위계산의 부인",
+        "조세 부담을 부당하게 감소",
+        "특수관계인",
+        "법인 설립",
+        "소득 분산",
+        "실질적인 용역",
+        "경제적 합리성",
+        "건전한 사회통념",
+        "상관행",
+        "시가",
+        "제41조",
         "제98조",
     ]
 
@@ -287,6 +362,22 @@ class ChunkSearchService:
 
     def build_search_conditions(self, question: str) -> dict:
         keywords = self.extract_keywords(question)
+        if self.is_closing_inventory_question(question, keywords):
+            keywords = self.prepend_unique(
+                ["폐업", "잔존재화", "남아 있는 재화", "자기생산ㆍ취득재화"],
+                keywords,
+            )
+        normalized_question = re.sub(r"\s+", "", question)
+        if any(term in normalized_question for term in ("공급가액", "부가가치세포함", "임대료", "월세", "부동산임대", "받은금액", "받은대가", "공급대가")):
+            keywords = self.prepend_unique(
+                ["공급가액", "받은 대가", "공급대가", "부가가치세 포함 여부 불분명", "110분의 100", "110분의 10", "부가가치세법 제29조"],
+                keywords,
+            )
+        if any(term in normalized_question for term in ("리스", "사업용차", "사업용자동차", "차량", "승용차", "화물차")):
+            keywords = self.prepend_unique(
+                ["자동차의 구입과 임차", "비영업용 소형승용차", "경형승용자동차", "운수업", "자동차판매업", "제39조", "제78조"],
+                keywords,
+            )
         concepts = extract_legal_concepts(question)
         keyword_weights = build_weighted_terms(concepts)
         required_roles = infer_required_roles(concepts)
@@ -318,9 +409,39 @@ class ChunkSearchService:
                 expanded_keywords,
             )
 
+        if self.is_exempt_invoice_penalty_question(question):
+            expanded_keywords = self.prepend_unique(
+                self.EXEMPT_INVOICE_PENALTY_QUERY_HINTS,
+                expanded_keywords,
+            )
+
+        if self.is_simple_taxpayer_invoice_question(question):
+            expanded_keywords = self.prepend_unique(
+                self.SIMPLE_TAXPAYER_INVOICE_QUERY_HINTS,
+                expanded_keywords,
+            )
+
+        if self.is_taxpayer_type_conversion_question(question):
+            expanded_keywords = self.prepend_unique(
+                ["간이과세자", "일반과세자", "전환", "직전 연도 공급대가", "제61조", "제109조"],
+                expanded_keywords,
+            )
+
+        if self.is_recognized_interest_question(question):
+            expanded_keywords = self.prepend_unique(
+                self.RECOGNIZED_INTEREST_QUERY_HINTS,
+                expanded_keywords,
+            )
+
         if self.is_special_relation_fee_question(question, expanded_keywords):
             expanded_keywords = self.prepend_unique(
                 self.SPECIAL_RELATION_FEE_QUERY_HINTS,
+                expanded_keywords,
+            )
+
+        if self.is_income_splitting_question(question):
+            expanded_keywords = self.prepend_unique(
+                self.INCOME_SPLITTING_QUERY_HINTS,
                 expanded_keywords,
             )
 
@@ -363,9 +484,19 @@ class ChunkSearchService:
 
         tax_domain = self.infer_tax_domain(keywords)
 
+        # 개인 프리랜서의 법인 설립을 통한 소득 분산은 질문에 '법인'이
+        # 포함되어도 출발점이 개인의 사업소득이므로 소득세 규정을 우선한다.
+        if self.is_income_splitting_question(question):
+            tax_domain = "소득세"
+
         law_names = self.extract_law_names(question)
         if not law_names:
             law_names = self.infer_law_names(tax_domain)
+        if self.is_income_splitting_question(question):
+            law_names = self.prepend_unique(
+                ["소득세법", "소득세법 시행령"],
+                law_names,
+            )
         concept_law_hints = self.deduplicate_keep_order([
             law_name
             for concept in concepts
@@ -375,6 +506,8 @@ class ChunkSearchService:
             law_names = self.prepend_unique(concept_law_hints, law_names)
 
         article_numbers = self.extract_article_numbers(question)
+        if self.is_closing_inventory_question(question, keywords):
+            article_numbers = self.prepend_unique(["제10조"], article_numbers)
         intent = self.detect_intent(question)
         action = self.detect_action(question)
 
@@ -643,7 +776,41 @@ class ChunkSearchService:
     ) -> bool:
         search_text = " ".join([question, *(keywords or [])])
 
+        if cls.is_recognized_interest_question(question):
+            return False
         return any(term in search_text for term in cls.BAD_DEBT_ALLOWANCE_TERMS)
+
+    @classmethod
+    def is_exempt_invoice_penalty_question(cls, question: str) -> bool:
+        compact_text = re.sub(r"\s+", "", question)
+        return (
+            "면세사업자" in compact_text
+            and "계산서" in compact_text
+            and any(term in compact_text for term in ("미발급", "발급하지", "가산세"))
+        )
+
+    @classmethod
+    def is_simple_taxpayer_invoice_question(cls, question: str) -> bool:
+        compact_text = re.sub(r"\s+", "", question)
+        return (
+            "간이과세" in compact_text
+            and "세금계산서" in compact_text
+            and any(term in compact_text for term in ("발급", "의무", "경우"))
+        )
+
+    @classmethod
+    def is_taxpayer_type_conversion_question(cls, question: str) -> bool:
+        compact_text = re.sub(r"\s+", "", question)
+        return "간이과세자" in compact_text and "일반과세자" in compact_text and any(
+            term in compact_text for term in ("전환", "변경", "기준", "판단")
+        )
+
+    @classmethod
+    def is_recognized_interest_question(cls, question: str) -> bool:
+        compact_text = re.sub(r"\s+", "", question)
+        return "가지급금" in compact_text and any(
+            term in compact_text for term in ("인정이자", "이자계산", "인정이자율")
+        )
 
     @classmethod
     def is_special_relation_fee_question(
@@ -672,6 +839,30 @@ class ChunkSearchService:
             )
         )
         return has_special_relation and has_fee_or_service and has_denial_issue
+
+    @classmethod
+    def is_income_splitting_question(cls, question: str) -> bool:
+        compact_text = re.sub(r"\s+", "", question)
+        has_individual_business = any(
+            term in compact_text
+            for term in ("프리랜서", "개인사업자", "사업소득")
+        )
+        has_company = "법인" in compact_text and any(
+            term in compact_text for term in ("설립", "전환", "명의")
+        )
+        has_splitting_issue = any(
+            term in compact_text
+            for term in ("소득분산", "소득을분산", "소득귀속", "부당행위계산", "실질과세")
+        )
+        return has_individual_business and has_company and has_splitting_issue
+
+    @classmethod
+    def uses_corporate_tax_for_special_relation(cls, question: str) -> bool:
+        """법인이라는 단어가 아닌 납세주체와 세목 표현으로 적용 세목을 판별한다."""
+        if cls.is_income_splitting_question(question):
+            return False
+        compact_text = re.sub(r"\s+", "", question)
+        return any(term in compact_text for term in ("법인세", "손금", "손금불산입"))
 
     @classmethod
     def is_business_withholding_question(
@@ -730,6 +921,18 @@ class ChunkSearchService:
             "부가가치세" in compact_text and "공제" in compact_text
         )
         return has_registration and has_before and has_input_tax
+
+    @classmethod
+    def is_closing_inventory_question(
+        cls,
+        question: str,
+        keywords: list[str] | None = None,
+    ) -> bool:
+        compact_text = re.sub(r"\s+", "", " ".join([question, *(keywords or [])]))
+        return "폐업" in compact_text and any(
+            term.replace(" ", "") in compact_text
+            for term in ("남아있는재화", "잔존재화", "자기생산ㆍ취득재화", "재고")
+        )
 
     @staticmethod
     def prepend_unique(priority_values: list[str], values: list[str]) -> list[str]:
@@ -851,13 +1054,87 @@ class ChunkSearchService:
                 }
             )
 
+        if cls.is_exempt_invoice_penalty_question(conditions["original_question"]):
+            law_names = cls.prepend_unique(
+                ["소득세법", "법인세법"],
+                conditions["law_names"],
+            )
+            keywords = cls.prepend_unique(
+                cls.EXEMPT_INVOICE_PENALTY_QUERY_HINTS,
+                conditions["keywords"],
+            )
+            supplemental_conditions.append(
+                {
+                    "law_names": law_names,
+                    "keywords": keywords,
+                    "rewritten_query": (
+                        "면세사업자 계산서 발급 미발급 지연발급 계산서합계표 가산세 "
+                        "소득세법 제163조 제81조의10 법인세법 제121조 제75조의8 "
+                        "공급가액 2퍼센트 1퍼센트 0.5퍼센트"
+                    ),
+                }
+            )
+
+        if cls.is_simple_taxpayer_invoice_question(conditions["original_question"]):
+            law_names = cls.prepend_unique(
+                ["부가가치세법", "부가가치세법 시행령"],
+                conditions["law_names"],
+            )
+            keywords = cls.prepend_unique(
+                cls.SIMPLE_TAXPAYER_INVOICE_QUERY_HINTS,
+                conditions["keywords"],
+            )
+            supplemental_conditions.append(
+                {
+                    "law_names": law_names,
+                    "keywords": keywords,
+                    "rewritten_query": (
+                        "부가가치세법 제32조 제36조 제36조의2 제61조 제68조의2 "
+                        "부가가치세법 시행령 제109조 간이과세자 세금계산서 발급 의무 "
+                        "직전 연도 공급대가 4천800만원 1억4백만원 미발급 가산세"
+                    ),
+                }
+            )
+
+        if cls.is_taxpayer_type_conversion_question(conditions["original_question"]):
+            law_names = cls.prepend_unique(
+                ["부가가치세법", "부가가치세법 시행령"], conditions["law_names"]
+            )
+            supplemental_conditions.append(
+                {
+                    "law_names": law_names,
+                    "keywords": ["간이과세자", "일반과세자", "전환", "직전 연도 공급대가", "제61조", "제109조"],
+                    "rewritten_query": "부가가치세법 제61조 간이과세 적용범위 일반과세자 전환 직전 연도 공급대가 부가가치세법 시행령 제109조",
+                }
+            )
+
+        if cls.is_recognized_interest_question(conditions["original_question"]):
+            law_names = cls.prepend_unique(
+                ["법인세법", "법인세법 시행령"],
+                conditions["law_names"],
+            )
+            keywords = cls.prepend_unique(
+                cls.RECOGNIZED_INTEREST_QUERY_HINTS,
+                conditions["keywords"],
+            )
+            supplemental_conditions.append(
+                {
+                    "law_names": law_names,
+                    "keywords": keywords,
+                    "rewritten_query": (
+                        "법인세법 제52조 법인세법 시행령 제88조 제89조 "
+                        "대표이사 특수관계인 가지급금 인정이자 금전 대여 시가 "
+                        "가중평균차입이자율 당좌대출이자율 가지급금 적수 365"
+                    ),
+                }
+            )
+
         if cls.is_special_relation_fee_question(
             conditions["original_question"],
             conditions["keywords"],
         ):
-            uses_corporate_tax = any(
-                term in conditions["original_question"]
-                for term in ("법인세", "손금", "법인")
+            uses_corporate_tax = cls.uses_corporate_tax_for_special_relation(
+                conditions["original_question"]
             )
             law_names = (
                 ["법인세법", "법인세법 시행령"]
@@ -879,6 +1156,22 @@ class ChunkSearchService:
                         law_names,
                         conditions["law_names"],
                     ),
+                    "keywords": keywords,
+                    "rewritten_query": " ".join(
+                        cls.deduplicate_keep_order(law_names + keywords)
+                    ),
+                }
+            )
+
+        if cls.is_income_splitting_question(conditions["original_question"]):
+            law_names = ["소득세법", "소득세법 시행령"]
+            keywords = cls.prepend_unique(
+                cls.INCOME_SPLITTING_QUERY_HINTS,
+                conditions["keywords"],
+            )
+            supplemental_conditions.append(
+                {
+                    "law_names": cls.prepend_unique(law_names, conditions["law_names"]),
                     "keywords": keywords,
                     "rewritten_query": " ".join(
                         cls.deduplicate_keep_order(law_names + keywords)
@@ -1243,6 +1536,14 @@ class ChunkSearchService:
             return chunks[:top_k]
 
         has_three_percent = "3.3%" in query_text or "3.3" in query_text
+        normalized_query = re.sub(r"\s+", "", query_text)
+        has_supply_value_calculation = any(
+            term in normalized_query for term in ("공급가액", "부가가치세포함", "임대료", "월세", "부동산임대", "받은금액", "받은대가", "공급대가")
+        )
+        has_vehicle_input_tax_question = any(
+            term in normalized_query
+            for term in ("리스", "사업용차", "사업용자동차", "차량", "승용차", "화물차")
+        )
         has_business_income = "사업소득" in keywords
         has_withholding = "원천징수" in keywords
 
@@ -1254,9 +1555,21 @@ class ChunkSearchService:
             query_text,
             keywords,
         )
-        has_special_relation_fee = ChunkSearchService.is_special_relation_fee_question(
-            query_text,
-            keywords,
+        has_recognized_interest = ChunkSearchService.is_recognized_interest_question(
+            query_text
+        )
+        has_simple_taxpayer_invoice = ChunkSearchService.is_simple_taxpayer_invoice_question(
+            query_text
+        )
+        has_taxpayer_type_conversion = ChunkSearchService.is_taxpayer_type_conversion_question(
+            query_text
+        )
+        has_exempt_invoice_penalty = ChunkSearchService.is_exempt_invoice_penalty_question(
+            query_text
+        )
+        has_special_relation_fee = (
+            ChunkSearchService.is_special_relation_fee_question(query_text, keywords)
+            or ChunkSearchService.is_income_splitting_question(query_text)
         )
         has_business_withholding = ChunkSearchService.is_business_withholding_question(
             query_text,
@@ -1271,6 +1584,10 @@ class ChunkSearchService:
             keywords,
         )
         has_pre_registration_input_tax = ChunkSearchService.is_pre_registration_input_tax_question(
+            query_text,
+            keywords,
+        )
+        has_closing_inventory = ChunkSearchService.is_closing_inventory_question(
             query_text,
             keywords,
         )
@@ -1318,7 +1635,6 @@ class ChunkSearchService:
                 if not (has_registration and has_input_tax):
                     chunk.score = 0.0
                     continue
-
                 if "제39조" in title_text:
                     score += 100.0
                 if "사업자등록을 신청하기 전" in combined_text:
@@ -1327,6 +1643,17 @@ class ChunkSearchService:
                     score += 40.0
                 if any(term in title_text for term in ("전환", "재고품", "감가상각자산")):
                     score -= 100.0
+
+            if has_closing_inventory:
+                combined_text = f"{title_text} {content_text}"
+                # 폐업 잔존재화는 부가가치세법 제10조 제6항이 직접 근거다.
+                if "부가가치세법" not in (chunk.law_name or ""):
+                    chunk.score = 0.0
+                    continue
+                if "제10조" in title_text and "폐업" in combined_text and "남아" in combined_text:
+                    score += 180.0
+                elif "폐업" not in combined_text or "재화" not in combined_text:
+                    score -= 60.0
 
             for term in query_terms:
                 title_hits = min(title_text.count(term), 2)
@@ -1395,6 +1722,93 @@ class ChunkSearchService:
                 if "인적용역" in title_text or "인적용역" in content_text:
                     score += 5.0
 
+            if has_exempt_invoice_penalty:
+                combined_text = f"{title_text} {content_text}"
+                target_articles = ("제163조", "제81조의10", "제121조", "제75조의8")
+                if any(term in combined_text for term in target_articles):
+                    score += 150.0
+                if "계산서" in combined_text and "공급가액의 100분의 2" in combined_text:
+                    score += 90.0
+                if "지연" in combined_text or "다음 달 25일" in combined_text or "1월 25일" in combined_text:
+                    score += 45.0
+                if "소규모사업자" in combined_text:
+                    score += 25.0
+                if "계산서의 작성" in title_text and "발급" in title_text:
+                    score += 120.0
+                if "매입처별 세금계산서합계표" in title_text:
+                    score -= 100.0
+                if "신용카드" in title_text or "현금영수증" in title_text:
+                    score -= 130.0
+
+            if has_simple_taxpayer_invoice:
+                combined_text = f"{title_text} {content_text}"
+                target_titles = ("제32조", "제36조", "제61조", "제68조", "제109조")
+                if any(term in title_text for term in target_titles):
+                    score += 130.0
+                if "4천800만원" in combined_text:
+                    score += 80.0
+                if "1억4백만원" in combined_text:
+                    score += 55.0
+                if "세금계산서" in combined_text and "간이과세자" in combined_text:
+                    score += 60.0
+                if "수정세금계산서" in title_text or "제70조" in title_text:
+                    score -= 150.0
+
+            if has_taxpayer_type_conversion:
+                combined_text = f"{title_text} {content_text}"
+                if any(term in title_text for term in ("제61조", "제109조")):
+                    score += 220.0
+                if "일반과세자" in combined_text and "간이과세자" in combined_text:
+                    score += 100.0
+                if "직전 연도" in combined_text and "공급대가" in combined_text:
+                    score += 80.0
+                if any(term in title_text for term in ("제44조", "제86조", "재고")):
+                    score -= 140.0
+
+            if has_supply_value_calculation:
+                combined_text = f"{title_text} {content_text}"
+                if "부가가치세법" in (chunk.law_name or "") and "제29조" in title_text:
+                    score += 240.0
+                if any(term in combined_text for term in ("110분의 100", "110분의 10", "공급가액", "받은 대가", "공급대가")):
+                    score += 90.0
+                if "부가가치세 포함" in combined_text and "불분명" in combined_text:
+                    score += 80.0
+                if "부동산임대공급가액명세서" in combined_text or "임대공급가액명세서" in combined_text:
+                    score -= 110.0
+                if any(term in title_text for term in ("서식", "제출", "신고서")):
+                    score -= 70.0
+
+            if has_vehicle_input_tax_question:
+                combined_text = f"{title_text} {content_text}"
+                if "제39조" in title_text and "자동차" in combined_text:
+                    score += 220.0
+                if "제78조" in title_text or "운수업" in combined_text or "자동차판매업" in combined_text:
+                    score += 120.0
+                if any(term in combined_text for term in ("자동차의 구입과 임차", "비영업용 소형승용차", "경형승용자동차")):
+                    score += 100.0
+                if any(term in title_text for term in ("서식", "명세서", "제출")):
+                    score -= 100.0
+
+            if has_recognized_interest:
+                combined_text = f"{title_text} {content_text}"
+                is_target_article = (
+                    ("법인세법" == (chunk.law_name or "") and "제52조" in title_text)
+                    or (
+                        "법인세법 시행령" in (chunk.law_name or "")
+                        and any(term in title_text for term in ("제88조", "제89조"))
+                    )
+                )
+                if is_target_article:
+                    score += 140.0
+                if "가중평균차입이자율" in combined_text:
+                    score += 70.0
+                if "당좌대출이자율" in combined_text:
+                    score += 70.0
+                if "금전" in combined_text and "시가" in combined_text:
+                    score += 35.0
+                if any(term in title_text for term in ("제19조의2", "제34조", "제61조")):
+                    score -= 120.0
+
             if has_bad_debt_allowance:
                 combined_text = f"{title_text} {content_text}"
                 target_article = (
@@ -1440,9 +1854,8 @@ class ChunkSearchService:
 
             if has_special_relation_fee:
                 combined_text = f"{title_text} {content_text}"
-                uses_corporate_tax = any(
-                    term in query_text
-                    for term in ("법인세", "손금", "법인")
+                uses_corporate_tax = ChunkSearchService.uses_corporate_tax_for_special_relation(
+                    query_text
                 )
                 if uses_corporate_tax:
                     is_target_article = (

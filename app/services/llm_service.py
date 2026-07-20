@@ -13,7 +13,7 @@ from app.core.config import get_settings
 
 
 class LlmService:
-    PROMPT_VERSION = "2026-07-15-grounded-context-v8"
+    PROMPT_VERSION = "2026-07-16-detailed-grounded-v9"
 
     def __init__(self) -> None:
         settings = get_settings()
@@ -98,6 +98,10 @@ class LlmService:
                 term in compact_question
                 for term in ("부당행위계산", "필요경비", "손금", "부인")
             )
+        ) or (
+            any(term in compact_question for term in ("프리랜서", "개인사업자", "사업소득"))
+            and "법인" in compact_question
+            and any(term in compact_question for term in ("소득분산", "소득을분산", "부당행위계산"))
         )
         if len(context) > self.max_context_chars:
             context = context[:self.max_context_chars]
@@ -143,23 +147,38 @@ class LlmService:
                         "너는 한국 세법 검색 답변 도우미다. 사고 과정은 쓰지 말고 한국어 최종 답변만 즉시 작성하라.\n"
                         "규칙:\n"
                         "- 제공된 법령·판례 근거만 사용하고 추론하지 않는다.\n"
-                        "- 직접 근거가 없으면 '제공된 근거만으로는 판단할 수 없습니다.'라고 쓴다.\n"
+                        "- 최종 적용 여부를 확정할 직접 근거가 부족해도, 검색 근거에서 확인되는 "
+                        "일반 원칙·판단 기준·위험 요인을 먼저 구체적으로 설명한 뒤 부족한 사실을 밝힌다.\n"
                         "- 질문이 일반적인 판단 기준을 묻고 검색 근거가 그 기준을 제시하면, "
                         "구체적 사실관계가 없다는 이유만으로 판단 불가라고 하지 않는다.\n"
                         "- 금액·기간·조건은 근거에 있는 내용을 빠뜨리지 않는다.\n"
                         "- 관련 없는 조문은 인용하지 않는다.\n"
+                        "- 질문에 법령상 특정 행위(예: 폐업 시 남은 재화)가 포함되면 그 행위를 직접 규정한 조문을 최우선 근거로 삼는다.\n"
+                        "- 검색 근거에 직접 조문이 있으면 시행령의 보조 조문이나 유사한 세액공제 조문으로 결론을 대체하지 않는다.\n"
+                        "- 결론은 인용한 조문 내용과 반드시 일치해야 하며, 조문에 반하는 일반적 설명을 쓰지 않는다.\n"
+                        "- 간이과세자와 일반과세자 전환 기준 질문에는 전환 기준(직전 연도 공급대가·업종별 기준)을 먼저 답하고, 전환 후 재고매입세액 특례를 전환 기준으로 설명하지 않는다.\n"
+                        "- 먼저 질문의 상황을 신고 전, 이미 신고 완료, 잘못된 금액으로 신고, 단순 계산 질문 중 하나로 구분한다. 질문에 신고 완료 또는 잘못 신고했다는 사실이 없으면 수정신고·경정청구를 먼저 권하지 않는다.\n"
+                        "- 단순 계산 질문은 계산 기준을 먼저 직접 답한다. 부가가치세 포함 여부가 불분명하거나 별도 약정이 없고 실제 받은 금액이 확인되면 공급가액은 실제 받은 금액×110분의 100, 부가가치세는 실제 받은 금액×110분의 10으로 설명한다. 단, 이 계산 조문이 검색 근거에 없으면 해당 수치를 만들어내지 말고 계산 기준을 확인할 수 없다고 한다.\n"
+                        "- 상가·사무실 등 과세 임대를 전제로 한 월세 계산 질문에서 계약서에 부가가치세 별도 약정이 없고 포함 여부가 불분명하면 실제 받은 금액×100/110을 공급가액, 실제 받은 금액×10/110을 부가가치세로 답한다. 실제 받은 월세 1,000,000원이면 공급가액 909,091원, 부가가치세 90,909원으로 계산한다(원 단위 반올림).\n"
+                        "- 계약서에 부가가치세 별도 약정이 명확하면 약정 월세 전액을 공급가액으로 보고 그 10%를 부가가치세로 계산한다. 주택 임대 등 면세 여부가 문제될 수 있으면 이 예외를 짧게 알린다.\n"
+                        "- 사업용 차량·리스의 매입세액 질문에서는 사업용이라는 이유만으로 공제된다고 단정하지 않는다. 부가가치세법 제39조제1항제5호의 자동차 구입·임차·유지 매입세액 불공제 원칙과, 운수업·자동차판매업 등 대통령령상 업종에 직접 영업용으로 사용하는 예외를 구분한다. 법령 근거에 없는 배기량·승차정원 기준은 임의로 만들지 않는다.\n"
+                        "- 이미 신고했거나 잘못된 금액으로 신고했다고 명시된 경우에만 후속 조치를 안내한다. 신고기한 전이면 기존 신고서를 다시 작성해 기한 내 신고, 신고기한 후 과소신고·과소납부면 수정신고 검토, 신고기한 후 과다신고·과다납부면 경정청구 검토로 구분한다. 구체적 내역이 없으면 신고서와 임대차계약서 확인이 필요하다고 한다.\n"
+                        "- 계산 질문의 답변 순서는 반드시 1. 결론 2. 계산 방법 3. 예외 또는 조건별 구분 4. 확인할 사실관계 5. 검색 근거로 한다. 이미 신고한 경우의 수정신고·경정청구 조치는 질문에 신고 완료 또는 오류 신고 사실이 있을 때만 3번에 포함한다.\n"
+                        "- 임대인이 별도 약정 없이 월세를 받은 질문에서 사용자가 이미 신고했다고 말하지 않았다면 수정신고나 경정청구를 안내하지 않는다.\n"
+                        "- 질문과 직접 관련된 계산 조문이 검색 근거에 없으면 서식·제출절차 조문으로 계산 방법을 추론하지 말고 '제공된 근거만으로는 계산 기준을 확인할 수 없습니다.'라고 한다.\n"
                         "- 지급자·수령자, 제공자·제공받는 자와 고가·저가의 거래 방향을 바꾸지 않는다.\n"
                         "- 사건번호·선고일·조문번호는 검색 근거의 값을 한 글자도 바꾸지 않고 옮긴다.\n"
                         "- 결론에는 질문이 요구한 항목을 실제로 나열하고 조문번호만 쓰지 않는다.\n"
                         f"{source_specific_rules}"
                         f"{transaction_direction_rules}"
-                        "- 전체 350자 이내로 간결하게 작성한다.\n"
+                        "- 질문에 단순히 예·아니요로 답할 수 없으면 '적용될 수 있으나 사실관계에 따라 달라진다'는 "
+                        "조건부 결론을 쓰고, 적용 요건과 반대 사정을 각각 설명한다.\n"
+                        "- 사용자가 후속으로 확인해야 할 계약, 업무 수행, 인력·시설, 대금과 시가, 소득 귀속 등 "
+                        "구체적 자료를 검색 근거 범위 안에서 체크리스트로 제시한다.\n"
+                        "- 전체 900자 이내로 작성한다. 근거가 충분하면 지나치게 짧게 끝내지 않는다.\n"
                         "판례 근거가 있으면 형식:\n"
                         "1. 일반 법리\n2. 해당 사건 결론\n3. 이유\n"
-                        "판례 근거가 없으면 형식:\n"
-                        "1. 결론\n2. 검색 근거(법령명·조문명·사건번호)\n"
-                        "3. 근거의 범위(일반 판단 기준의 근거가 있으면 "
-                        "'일반 판단 기준에 관한 근거는 충분함'이라고 쓴다)"
+                        "판례 근거가 없으면 다음 형식을 사용한다: 1. 결론 2. 계산 방법 3. 예외 또는 조건별 구분 4. 확인할 사실관계 5. 검색 근거. 답변은 5번 검색 근거에서 끝낸다."
                     ),
                 },
                 {
@@ -184,39 +203,7 @@ class LlmService:
         content_parts = [
             piece async for piece in self.stream_answer(question=question, context=context)
         ]
-        answer = "".join(content_parts).strip()
-        if self.is_structure_only_answer(answer):
-            return (
-                "1. 결론\n"
-                "검색 근거는 확인했지만 답변 내용이 정상적으로 생성되지 않았습니다. "
-                "대상, 용도, 취득 시기 등 사실관계를 조금 더 구체적으로 입력해 주세요.\n\n"
-                "2. 근거의 범위\n"
-                "제공된 근거만으로 특정 감면 요건을 확정하지 않았습니다."
-            )
-        return answer
-
-    @staticmethod
-    def is_structure_only_answer(answer: str) -> bool:
-        if not answer.strip():
-            return True
-
-        structural_phrases = (
-            "결론",
-            "검색 근거",
-            "법령명",
-            "조문명",
-            "사건번호",
-            "근거의 범위",
-            "일반 판단 기준에 관한 근거는 충분함",
-            "일반 법리",
-            "해당 사건 결론",
-            "이유",
-        )
-        remainder = answer
-        for phrase in structural_phrases:
-            remainder = remainder.replace(phrase, "")
-        remainder = re.sub(r"[\d\s.():·ㆍ,\-]+", "", remainder)
-        return len(remainder) < 12
+        return "".join(content_parts)
 
     async def stream_answer(self, question: str, context: str) -> AsyncIterator[str]:
         context = (context or "").strip()
@@ -331,61 +318,24 @@ class LlmService:
         await self._set_cached_answer(answer_cache_key, content)
 
     @staticmethod
-    def try_generate_broad_acquisition_tax_relief_answer(
-        question: str,
-        context: str,
-    ) -> str | None:
-        compact_question = re.sub(r"\s+", "", question)
-        if "취득세" not in compact_question or "감면" not in compact_question:
-            return None
-        if not any(term in compact_question for term in ("요건", "조건", "무엇")):
-            return None
-
-        specific_relief_terms = (
-            "생애최초",
-            "출산",
-            "양육",
-            "신혼부부",
-            "임대주택",
-            "사회복지",
-            "평생교육",
-            "농지",
-            "다자녀",
-            "전세사기",
-            "기회발전특구",
-            "인구감소지역",
-            "국가유공자",
-            "장애인",
-            "창업",
-            "기업이전",
-        )
-        if any(term in compact_question for term in specific_relief_terms):
-            return None
-        if "지방세특례제한법" not in context or "지방세 감면 특례의 제한" not in context:
-            return None
-
-        return (
-            "1. 결론\n"
-            "취득세 감면에는 하나의 공통 요건이 있는 것이 아니라, 취득 대상과 목적별로 "
-            "각기 다른 감면 조항이 적용됩니다. 현재 질문만으로는 적용할 감면 유형을 특정할 수 없습니다. "
-            "생애최초 주택, 출산·양육 주택, 임대주택, 사회복지시설 등 어떤 감면을 묻는지와 "
-            "취득자 유형, 부동산 용도, 취득일·가액, 소재지를 알려주세요.\n\n"
-            "2. 검색 근거\n"
-            "지방세특례제한법 제177조 지방세 감면 특례의 제한\n\n"
-            "3. 근거의 범위\n"
-            "개별 감면 유형이 특정되지 않아 구체적인 감면율과 세부 요건은 확정할 수 없습니다."
-        )
-
-    @staticmethod
     def try_generate_direct_answer(question: str, context: str) -> str | None:
-        broad_acquisition_tax_relief_answer = (
-            LlmService.try_generate_broad_acquisition_tax_relief_answer(
-                question,
-                context,
-            )
+        exempt_invoice_answer = LlmService.try_generate_exempt_invoice_penalty_answer(
+            question, context
         )
-        if broad_acquisition_tax_relief_answer is not None:
-            return broad_acquisition_tax_relief_answer
+        if exempt_invoice_answer is not None:
+            return exempt_invoice_answer
+
+        simple_taxpayer_answer = LlmService.try_generate_simple_taxpayer_invoice_answer(
+            question, context
+        )
+        if simple_taxpayer_answer is not None:
+            return simple_taxpayer_answer
+
+        recognized_interest_answer = LlmService.try_generate_recognized_interest_answer(
+            question, context
+        )
+        if recognized_interest_answer is not None:
+            return recognized_interest_answer
 
         treaty_beneficial_owner_answer = (
             LlmService.try_generate_treaty_beneficial_owner_denial_answer(
@@ -473,6 +423,119 @@ class LlmService:
             "제공된 법령 근거만으로 한도액은 확인됩니다. 다만 실제 적용 여부는 "
             "주택 수, 기준시가, 차입 시기, 상환 방식 등 소득세법 제52조 및 "
             "소득세법 시행령 제112조의 요건 충족 여부를 함께 확인해야 합니다."
+        )
+
+    @staticmethod
+    def try_generate_exempt_invoice_penalty_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = re.sub(r"\s+", "", question)
+        is_target = (
+            "면세사업자" in compact_question
+            and "계산서" in compact_question
+            and any(term in compact_question for term in ("미발급", "발급하지", "가산세"))
+        )
+        if not is_target:
+            return None
+        required_terms = ("제163조", "제81조의10", "제121조", "제75조의8")
+        if not all(term in context for term in required_terms):
+            return None
+
+        return (
+            "1. 결론\n"
+            "면세사업자라도 계산서 발급의무가 있는 거래에서 계산서를 발급하지 않으면 "
+            "미발급·지연발급 및 계산서합계표 제출 불성실 가산세가 적용될 수 있습니다. "
+            "개인사업자와 법인사업자 모두 기본 세율 구조는 같습니다.\n\n"
+            "2. 가산세 종류와 세율\n"
+            "- 미발급 가산세: 발급시기가 지난 뒤에도 해당 과세기간 또는 사업연도 종료 후 "
+            "다음 달 25일까지 계산서를 발급하지 않으면 공급가액의 2%\n"
+            "- 지연발급 가산세: 정해진 발급시기는 지났지만 위 다음 달 25일까지 발급하면 공급가액의 1%\n"
+            "- 필요적 기재사항 누락·사실과 다른 계산서: 공급가액의 1%\n"
+            "- 매출·매입처별 계산서합계표를 기한 내 제출하지 않거나 사실과 다르게 제출: 공급가액의 0.5%\n\n"
+            "3. 적용 전 확인사항\n"
+            "개인 면세사업자는 소득세법 제163조의 발급의무와 제81조의10을 적용하되, "
+            "대통령령으로 정하는 소규모사업자는 가산세 대상에서 제외됩니다. "
+            "법인 면세사업자는 법인세법 제121조와 제75조의8을 적용합니다. "
+            "부동산 매각 등 법령상 계산서 발급이 적합하지 않은 예외 거래도 확인해야 합니다.\n\n"
+            "4. 계산에 필요한 정보\n"
+            "공급가액, 실제 공급일과 계산서 발급일, 개인·법인 여부, 소규모사업자 해당 여부, "
+            "계산서합계표 제출 여부가 필요합니다.\n\n"
+            "검색 근거: 소득세법 제163조·제81조의10, 법인세법 제121조·제75조의8"
+        )
+
+    @staticmethod
+    def try_generate_simple_taxpayer_invoice_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = re.sub(r"\s+", "", question)
+        is_target = (
+            "간이과세" in compact_question
+            and "세금계산서" in compact_question
+            and any(term in compact_question for term in ("발급", "의무", "경우"))
+        )
+        if not is_target:
+            return None
+        required_terms = ("제36조", "4천800만원", "제61조")
+        if not all(term in context for term in required_terms):
+            return None
+
+        return (
+            "1. 결론\n"
+            "간이과세자도 직전 연도 공급대가 합계액이 4,800만원 이상이면 "
+            "과세되는 재화·용역을 공급할 때 세금계산서를 발급해야 합니다. "
+            "4,800만원 미만이면 원칙적으로 세금계산서 대신 영수증 또는 현금영수증을 발급합니다.\n\n"
+            "2. 매출 구간별 기준\n"
+            "- 직전 연도 공급대가 4,800만원 미만: 영수증 발급 대상\n"
+            "- 4,800만원 이상 1억400만원 미만: 간이과세자이지만 세금계산서 발급 대상\n"
+            "- 1억400만원 이상: 원칙적으로 일반과세자로 전환\n"
+            "업종·사업장 보유 현황에 따라 간이과세 적용이 배제되는 예외가 있습니다.\n\n"
+            "3. 적용 시기와 주의사항\n"
+            "4,800만원 기준에 따른 영수증 발급 적용 여부는 기준금액에 미달하거나 이상이 된 "
+            "해의 다음 해 7월 1일부터 그 다음 해 6월 30일까지 적용됩니다. "
+            "세금계산서 발급 대상 간이과세자가 발급하지 않으면 현행 간이과세자 가산세 규정에 따라 "
+            "미발급 공급가액의 1% 가산세가 적용될 수 있습니다.\n\n"
+            "4. 확인할 사항\n"
+            "직전 연도 공급대가, 신규사업자 여부, 거래가 과세 재화·용역인지, 업종별 간이과세 "
+            "배제 여부를 확인해야 합니다.\n\n"
+            "검색 근거: 부가가치세법 제32조·제36조·제36조의2·제61조·제68조의2, "
+            "부가가치세법 시행령 제109조"
+        )
+
+    @staticmethod
+    def try_generate_recognized_interest_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = re.sub(r"\s+", "", question)
+        is_target = (
+            "가지급금" in compact_question
+            and any(term in compact_question for term in ("인정이자", "이자계산", "인정이자율"))
+        )
+        if not is_target:
+            return None
+        required_terms = ("제89조", "가중평균차입이자율", "당좌대출이자율")
+        if not all(term in context for term in required_terms):
+            return None
+
+        return (
+            "1. 계산식\n"
+            "대표이사 가지급금 인정이자는 [가지급금 적수 × 적용 이자율 ÷ 365]에서 실제 받은 이자를 뺀 금액입니다. "
+            "가지급금 적수는 매일의 가지급금 잔액을 합산한 값이므로, 금액이 변동되면 기간별 잔액 × 보유일수를 각각 계산해 합산합니다.\n\n"
+            "2. 적용 이자율\n"
+            "원칙은 법인세법 시행령 제89조제3항의 가중평균차입이자율입니다. "
+            "가중평균차입이자율을 적용할 수 없는 경우, 대여기간이 5년을 초과하는 경우, "
+            "또는 법인이 신고와 함께 당좌대출이자율을 선택한 경우에는 당좌대출이자율을 적용합니다. "
+            "법인세법 시행규칙 제43조제2항의 당좌대출이자율은 연 4.6%이며, 선택하면 선택 사업연도와 이후 2개 사업연도에 적용됩니다.\n\n"
+            "3. 예시\n"
+            "가지급금 1억원이 100일간 유지되고 실제 받은 이자가 없다면, 연 4.6% 적용 시 "
+            "1억원 × 100일 × 4.6% ÷ 365 = 약 1,260,274원입니다.\n\n"
+            "4. 세무 처리와 확인사항\n"
+            "계산한 인정이자에서 실제 수입이자를 차감한 금액을 익금에 산입합니다. "
+            "정확한 계산에는 날짜별 잔액, 발생일·회수일, 실제 수입이자, 법인의 차입금과 "
+            "가중평균차입이자율 적용 가능 여부를 확인해야 합니다.\n\n"
+            "검색 근거: 법인세법 제52조, 법인세법 시행령 제88조·제89조, 법인세법 시행규칙 제43조"
         )
 
     @staticmethod
