@@ -18,6 +18,27 @@ class LegalConceptSpec:
 # expressions that tend to appear in statutes and judgments.
 LEGAL_CONCEPT_SPECS: tuple[LegalConceptSpec, ...] = (
     LegalConceptSpec(
+        concept_id="NOMINEE_BUSINESS",
+        role="LEGAL_STANDARD",
+        aliases=(
+            "명의상 사업자",
+            "사업자 명의자",
+            "명의자와 실제 운영자",
+            "명의자와 실질 사업자",
+            "명의를 빌려",
+            "명의를 빌린",
+            "실질 사업자",
+        ),
+        search_terms=(
+            "실질과세",
+            "사실상 귀속되는 자",
+            "명의일 뿐이고",
+            "납세의무자",
+        ),
+        weight=10.0,
+        law_hints=("국세기본법",),
+    ),
+    LegalConceptSpec(
         concept_id="LOCAL_TAX",
         role="DOMAIN",
         aliases=("지방세", "취득세", "재산세", "등록면허세"),

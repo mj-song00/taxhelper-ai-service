@@ -331,6 +331,17 @@ class ChunkSearchService:
         "등록신청일", "과세기간 기산일",
     ]
 
+    NOMINEE_BUSINESS_QUERY_HINTS = [
+        "국세기본법",
+        "제14조",
+        "실질과세",
+        "명의일 뿐이고",
+        "사실상 귀속되는 자",
+        "납세의무자",
+        "손익의 귀속",
+        "지배ㆍ관리",
+    ]
+
     PARTICLE_SUFFIXES = (
         "으로부터", "에서", "으로", "에게", "한테", "까지", "부터",
         "처럼", "보다", "마저", "조차", "이라도", "라도", "이나",
@@ -469,6 +480,12 @@ class ChunkSearchService:
                 expanded_keywords,
             )
 
+        if self.is_nominee_business_question(question):
+            expanded_keywords = self.prepend_unique(
+                self.NOMINEE_BUSINESS_QUERY_HINTS,
+                expanded_keywords,
+            )
+
         concept_keywords = [
             term
             for term, weight in sorted(
@@ -504,6 +521,8 @@ class ChunkSearchService:
         ])
         if concept_law_hints:
             law_names = self.prepend_unique(concept_law_hints, law_names)
+        if self.is_nominee_business_question(question):
+            law_names = self.prepend_unique(["국세기본법"], law_names)
 
         article_numbers = self.extract_article_numbers(question)
         if self.is_closing_inventory_question(question, keywords):
@@ -1262,7 +1281,39 @@ class ChunkSearchService:
                     ),
                 }
             )
+        if cls.is_nominee_business_question(conditions["original_question"]):
+            law_names = cls.prepend_unique(
+                ["국세기본법"],
+                conditions["law_names"],
+            )
+            supplemental_conditions.append(
+                {
+                    "law_names": law_names,
+                    "keywords": cls.NOMINEE_BUSINESS_QUERY_HINTS,
+                    "rewritten_query": (
+                        "국세기본법 제14조 실질과세 과세 대상 거래의 귀속이 "
+                        "명의일 뿐이고 사실상 귀속되는 자 납세의무자"
+                    ),
+                }
+            )
         return supplemental_conditions
+
+    @staticmethod
+    def is_nominee_business_question(question: str) -> bool:
+        compact_question = re.sub(r"\s+", "", question or "")
+        has_nominee = any(
+            term in compact_question
+            for term in ("명의상", "명의자", "명의를빌려", "명의를빌린", "사업자명의")
+        )
+        has_actual_operator = any(
+            term in compact_question
+            for term in ("실제운영자", "실질사업자", "실질대표", "사실상귀속")
+        )
+        asks_taxpayer = any(
+            term in compact_question
+            for term in ("납세의무자", "납세의무", "세금", "부가가치세", "누구")
+        )
+        return has_nominee and has_actual_operator and asks_taxpayer
 
     @staticmethod
     def extract_keywords(question: str) -> list[str]:

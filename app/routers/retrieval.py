@@ -24,6 +24,12 @@ from app.services.precedent_search_service import PrecedentSearchService
 
 router = APIRouter(tags=["retrieval"])
 
+NOMINEE_BUSINESS_BASIS = (
+    "국세기본법 제14조제1항(실질과세): 과세의 대상이 되는 소득, 수익, "
+    "재산, 행위 또는 거래의 귀속이 명의일 뿐이고 사실상 귀속되는 자가 "
+    "따로 있을 때에는 사실상 귀속되는 자를 납세의무자로 하여 세법을 적용한다."
+)
+
 
 def log_chat_timing(
     request_id: str,
@@ -132,6 +138,7 @@ def build_sources(
     precedent_chunks: list[dict],
 ) -> list[dict]:
     sources: list[dict] = []
+    seen_precedent_keys: set[str] = set()
 
     for chunk in law_chunks:
         sources.append(
@@ -149,6 +156,16 @@ def build_sources(
 
     for chunk in precedent_chunks:
         metadata = chunk.get("metadata") or {}
+        case_number = str(metadata.get("caseNumber") or "").strip()
+        precedent_id = str(chunk.get("precedent_id") or "").strip()
+        # A judgment can be stored more than once or split into multiple
+        # chunks (issue/summary/full text). Keep all chunks in the LLM context,
+        # but expose only one source card per case to the user.
+        precedent_key = case_number or precedent_id
+        if precedent_key and precedent_key in seen_precedent_keys:
+            continue
+        if precedent_key:
+            seen_precedent_keys.add(precedent_key)
         sources.append(
             {
                 "source_type": "precedent",
@@ -156,7 +173,7 @@ def build_sources(
                 "precedent_id": chunk.get("precedent_id"),
                 "title": chunk.get("title"),
                 "court_name": metadata.get("courtName"),
-                "case_number": metadata.get("caseNumber"),
+                "case_number": case_number or None,
                 "case_name": metadata.get("caseName"),
                 "sentencing_date": metadata.get("sentencingDate"),
                 "case_conclusion_hint": infer_precedent_conclusion_hint(
@@ -353,6 +370,24 @@ async def prepare_chat(
         )
         for chunk in context_precedent_chunks
     ]
+
+    # The current local law corpus does not contain the National Tax Basic Act.
+    # Supply the controlling provision for nominee-business questions so the
+    # answer and the source shown to the user stay aligned.
+    if law_service.is_nominee_business_question(request.question):
+        context = f"[보충 법령 근거]\n{NOMINEE_BUSINESS_BASIS}\n\n{context}"
+        law_chunk_data.insert(
+            0,
+            {
+                "chunk_id": "curated-national-tax-basic-act-14",
+                "law_name": "국세기본법",
+                "title": "제14조 실질과세",
+                "article": "제14조",
+                "content": NOMINEE_BUSINESS_BASIS,
+                "content_truncated": False,
+                "score": None,
+            },
+        )
 
     return PreparedChat(
         context=context,

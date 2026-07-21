@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+from pathlib import Path
 import re
 from time import monotonic, perf_counter
 from typing import AsyncIterator
@@ -12,8 +16,38 @@ import httpx
 from app.core.config import get_settings
 
 
+def _create_error_logger() -> logging.Logger:
+    logger = logging.getLogger("taxhelper.llm")
+    if logger.handlers:
+        return logger
+
+    log_dir = Path(
+        os.getenv(
+            "TAXHELPER_LOG_DIR",
+            str(Path(__file__).resolve().parents[1] / "logs"),
+        )
+    )
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        log_dir / "llm_errors.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return logger
+
+
+error_logger = _create_error_logger()
+
+
 class LlmService:
-    PROMPT_VERSION = "2026-07-16-detailed-grounded-v9"
+    PROMPT_VERSION = "2026-07-21-consignment-invoice-v11"
 
     def __init__(self) -> None:
         settings = get_settings()
@@ -156,6 +190,9 @@ class LlmService:
                         "- 질문에 법령상 특정 행위(예: 폐업 시 남은 재화)가 포함되면 그 행위를 직접 규정한 조문을 최우선 근거로 삼는다.\n"
                         "- 검색 근거에 직접 조문이 있으면 시행령의 보조 조문이나 유사한 세액공제 조문으로 결론을 대체하지 않는다.\n"
                         "- 결론은 인용한 조문 내용과 반드시 일치해야 하며, 조문에 반하는 일반적 설명을 쓰지 않는다.\n"
+                        "- 사업자등록 명의자와 실제 운영자가 다른 질문에서는 등록명의만으로 납세의무자를 확정하지 않는다. 국세기본법 제14조의 근거가 제공되면 거래와 손익의 사실상 귀속자를 납세의무자로 설명하고, 자금 출처·주요 자산 소유·계약과 계좌 관리·경영 의사결정·사업상 위험 부담을 종합 확인한다. 직원이 '사장님'으로 불렀다는 사실은 보조 정황일 뿐 단독 기준이 아니다.\n"
+                        "- 수정세금계산서의 각 발급사유를 서로 섞지 않는다. 계약 해제·매출 취소·환불은 부가가치세법 시행령 제70조제1항제2호만 적용하며, 같은 항 제4호의 내국신용장·구매확인서에 관한 '과세기간 종료 후 25일'을 계약 해제의 발급기한으로 사용하지 않는다.\n"
+                        "- 위탁판매에서는 재화를 인도하는 주체와 세금계산서 명의를 구분한다. 수탁자·대리인이 인도하면 그 수탁자·대리인이 위탁자·본인의 명의로 발급하고 자신의 등록번호를 덧붙인다. 위탁자·본인이 직접 인도하면 위탁자·본인이 발급할 수 있다. 근거 조문은 부가가치세법 시행령 제69조제1항이며 제6조로 바꾸어 쓰지 않는다.\n"
                         "- 간이과세자와 일반과세자 전환 기준 질문에는 전환 기준(직전 연도 공급대가·업종별 기준)을 먼저 답하고, 전환 후 재고매입세액 특례를 전환 기준으로 설명하지 않는다.\n"
                         "- 먼저 질문의 상황을 신고 전, 이미 신고 완료, 잘못된 금액으로 신고, 단순 계산 질문 중 하나로 구분한다. 질문에 신고 완료 또는 잘못 신고했다는 사실이 없으면 수정신고·경정청구를 먼저 권하지 않는다.\n"
                         "- 단순 계산 질문은 계산 기준을 먼저 직접 답한다. 부가가치세 포함 여부가 불분명하거나 별도 약정이 없고 실제 받은 금액이 확인되면 공급가액은 실제 받은 금액×110분의 100, 부가가치세는 실제 받은 금액×110분의 10으로 설명한다. 단, 이 계산 조문이 검색 근거에 없으면 해당 수치를 만들어내지 말고 계산 기준을 확인할 수 없다고 한다.\n"
@@ -205,7 +242,13 @@ class LlmService:
         ]
         return "".join(content_parts)
 
-    async def stream_answer(self, question: str, context: str) -> AsyncIterator[str]:
+    async def stream_answer(
+        self,
+        question: str,
+        context: str,
+        *,
+        _context_retry: bool = False,
+    ) -> AsyncIterator[str]:
         context = (context or "").strip()
 
         direct_answer = self.try_generate_direct_answer(question, context)
@@ -253,6 +296,11 @@ class LlmService:
             first_token_sec: float | None = None
             final_event: dict = {}
             async with self._client.stream("POST", url, json=payload) as response:
+                # Streaming responses are not buffered automatically. Read an error
+                # body before raise_for_status() so it remains available to the
+                # HTTPStatusError handler after the stream context is closed.
+                if response.is_error:
+                    await response.aread()
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line.strip():
@@ -282,6 +330,14 @@ class LlmService:
             )
 
         except httpx.ReadTimeout:
+            error_logger.exception(
+                "ollama_request_failed error=read_timeout model=%s url=%s "
+                "question_chars=%d context_chars=%d",
+                self.model,
+                url,
+                len(question),
+                len(context),
+            )
             print("========== Ollama 호출 실패 ==========")
             print("에러 타입:", httpx.ReadTimeout)
             print("에러 내용: read timeout")
@@ -290,6 +346,46 @@ class LlmService:
             return
 
         except httpx.HTTPStatusError as e:
+            error_body = e.response.text[:4000]
+            error_logger.error(
+                "ollama_request_failed error=http_status status_code=%d "
+                "model=%s url=%s question_chars=%d context_chars=%d response=%r",
+                e.response.status_code,
+                self.model,
+                url,
+                len(question),
+                len(context),
+                error_body,
+                exc_info=True,
+            )
+            if "exceed_context_size_error" in error_body and not _context_retry:
+                # _build_payload() already caps context at max_context_chars.
+                # Base the retry reduction on that effective size; using the raw
+                # pre-cap length can leave the retry payload almost unchanged.
+                effective_context_chars = min(len(context), self.max_context_chars)
+                reduced_context = context[
+                    : max(1000, int(effective_context_chars * 0.6))
+                ]
+                error_logger.warning(
+                    "ollama_context_retry model=%s original_context_chars=%d "
+                    "reduced_context_chars=%d",
+                    self.model,
+                    len(context),
+                    len(reduced_context),
+                )
+                print(
+                    f"[OLLAMA_RETRY] reason=context_size "
+                    f"original_context_chars={len(context)} "
+                    f"reduced_context_chars={len(reduced_context)}",
+                    flush=True,
+                )
+                async for piece in self.stream_answer(
+                    question,
+                    reduced_context,
+                    _context_retry=True,
+                ):
+                    yield piece
+                return
             print("========== Ollama 호출 실패 ==========")
             print("에러 타입:", type(e))
             print("상태 코드:", e.response.status_code)
@@ -299,6 +395,15 @@ class LlmService:
             return
 
         except httpx.RequestError as e:
+            error_logger.exception(
+                "ollama_request_failed error=request model=%s url=%s "
+                "question_chars=%d context_chars=%d detail=%s",
+                self.model,
+                url,
+                len(question),
+                len(context),
+                e,
+            )
             print("========== Ollama 호출 실패 ==========")
             print("에러 타입:", type(e))
             print("에러 내용:", str(e))
@@ -319,6 +424,49 @@ class LlmService:
 
     @staticmethod
     def try_generate_direct_answer(question: str, context: str) -> str | None:
+        nominee_business_answer = (
+            LlmService.try_generate_nominee_business_taxpayer_answer(
+                question,
+                context,
+            )
+        )
+        if nominee_business_answer is not None:
+            return nominee_business_answer
+
+        pos_sales_estimation_answer = (
+            LlmService.try_generate_pos_sales_estimation_answer(
+                question,
+                context,
+            )
+        )
+        if pos_sales_estimation_answer is not None:
+            return pos_sales_estimation_answer
+
+        third_party_invoice_answer = (
+            LlmService.try_generate_third_party_invoice_answer(
+                question,
+                context,
+            )
+        )
+        if third_party_invoice_answer is not None:
+            return third_party_invoice_answer
+
+        consignment_invoice_answer = (
+            LlmService.try_generate_consignment_sale_invoice_answer(
+                question, context
+            )
+        )
+        if consignment_invoice_answer is not None:
+            return consignment_invoice_answer
+
+        corrected_invoice_answer = (
+            LlmService.try_generate_cancelled_sale_corrected_invoice_answer(
+                question, context
+            )
+        )
+        if corrected_invoice_answer is not None:
+            return corrected_invoice_answer
+
         exempt_invoice_answer = LlmService.try_generate_exempt_invoice_penalty_answer(
             question, context
         )
@@ -423,6 +571,248 @@ class LlmService:
             "제공된 법령 근거만으로 한도액은 확인됩니다. 다만 실제 적용 여부는 "
             "주택 수, 기준시가, 차입 시기, 상환 방식 등 소득세법 제52조 및 "
             "소득세법 시행령 제112조의 요건 충족 여부를 함께 확인해야 합니다."
+        )
+
+    @staticmethod
+    def try_generate_nominee_business_taxpayer_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = re.sub(r"\s+", "", question or "")
+        has_nominee = any(
+            term in compact_question
+            for term in ("명의상", "명의자", "명의를빌려", "명의를빌린", "사업자명의")
+        )
+        has_actual_operator = any(
+            term in compact_question
+            for term in ("실제운영자", "실질사업자", "실질대표", "사실상귀속")
+        )
+        asks_taxpayer = any(
+            term in compact_question
+            for term in ("납세의무자", "납세의무", "세금", "부가가치세", "누구")
+        )
+        if not (has_nominee and has_actual_operator and asks_taxpayer):
+            return None
+
+        compact_context = re.sub(r"\s+", "", context or "")
+        required_basis = (
+            "제14조",
+            "명의일뿐이고",
+            "사실상귀속되는자",
+            "납세의무자",
+        )
+        if not all(term in compact_context for term in required_basis):
+            return None
+
+        return (
+            "1. 결론\n"
+            "사업자등록 명의자와 실제 운영자가 다르면 명의자라는 이유만으로 납세의무자를 "
+            "확정하지 않습니다. 거래와 사업 손익이 사실상 귀속되는 사람이 따로 있다면 그 "
+            "실질 귀속자가 부가가치세 납세의무자가 됩니다.\n\n"
+            "2. 판단 기준\n"
+            "사업자금의 출처, 사업용 부동산·장비 등 주요 자산의 소유, 계약 체결과 가격 결정, "
+            "사업용 계좌·장부 관리, 직원 지휘, 이익 수령 및 손실·채무 부담 등 사업을 실제로 "
+            "지배·관리하고 손익을 귀속받았는지를 종합하여 판단합니다.\n\n"
+            "3. 호칭의 의미\n"
+            "직원이 특정인을 '사장님'으로 불렀다는 사실은 실질 운영자를 추정하는 보조 정황 "
+            "중 하나일 뿐, 그 사실만으로 납세의무자가 되지는 않습니다. 단순 자금 대여나 일부 "
+            "업무 지원인지 실제 경영과 손익 귀속인지도 구분해야 합니다.\n\n"
+            "4. 확인할 사실관계\n"
+            "명의상 사업자와 실제 운영자 각각의 자금 투입, 자산 소유, 계약·계좌·장부 관리, "
+            "의사결정, 매출 귀속 및 사업 위험 부담 자료를 확인해야 합니다. 법인사업자라면 법인 "
+            "자체가 원칙적인 납세의무자이므로 개인사업자의 명의대여 문제와 구분해야 합니다.\n\n"
+            "5. 검색 근거\n"
+            "국세기본법 제14조제1항(실질과세)"
+        )
+
+    @staticmethod
+    def try_generate_pos_sales_estimation_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = re.sub(r"\s+", "", question or "").lower()
+        has_pos = (
+            "pos" in compact_question
+            or "포스" in compact_question
+            or "판매시점정보관리시스템" in compact_question
+        )
+        has_estimation = any(
+            term in compact_question
+            for term in ("추계", "매출누락", "수입금액")
+        )
+        if not (has_pos and has_estimation):
+            return None
+
+        required_basis = (
+            "2008두7687",
+            "판매시점정보관리시스템",
+            "합리성과 타당성",
+            "증명책임",
+        )
+        if not all(term in context for term in required_basis):
+            return None
+
+        return (
+            "1. 일반 법리\n"
+            "수입금액을 추계할 요건이 있다는 것만으로는 부족하고, 그 내용과 방법이 구체적인 "
+            "사안에서 실제 수입금액에 가장 가깝게 반영될 정도로 합리적이고 타당해야 합니다. "
+            "원칙적으로 추계방법의 합리성과 타당성은 과세관청이 증명합니다. 다만 과세관청이 "
+            "법령이 정한 방법과 절차에 따라 추계했다면 합리성과 타당성은 일단 증명된 것으로 "
+            "보고, 그 방법이 현저히 불합리하다는 점은 이를 다투는 납세자가 증명해야 합니다.\n\n"
+            "2. 해당 사건 결론\n"
+            "대법원 2010. 10. 14. 선고 2008두7687 판결은 POS 입력 매출액과 원·부재료비의 "
+            "비율을 다른 기간에 적용한 매출 추계가 합리적이라고 보아 과세처분을 적법하다고 "
+            "판단한 원심을 수긍했습니다.\n\n"
+            "3. 판단 이유\n"
+            "POS 매출은 판매와 동시에 입력되고 다른 조사자료와도 부합하여 신빙성이 높았으며, "
+            "돼지고기·음료수·주류 등 원·부재료는 매출과 직접 관련되었습니다. 또한 장기간 계속 "
+            "거래한 규모 있는 납품업체가 세금계산서를 발행해 매입금액이 비교적 정확했고, 특별한 "
+            "사정이 없다면 매출액 대비 원·부재료비 비율이 상당 기간 유지된다고 볼 수 있었습니다.\n\n"
+            "검색 근거: 대법원 2010. 10. 14. 선고 2008두7687 판결"
+        )
+
+    @staticmethod
+    def try_generate_third_party_invoice_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = re.sub(r"\s+", "", question or "")
+        has_invoice = "세금계산서" in compact_question
+        has_different_party = any(
+            term in compact_question
+            for term in ("실제공급자와다른", "공급자가실제공급자와다른", "제3자명의", "명의위장")
+        )
+        asks_case_or_good_faith = any(
+            term in compact_question
+            for term in ("선의의거래당사자", "선의", "사례", "판례", "인정")
+        )
+        if not (has_invoice and has_different_party and asks_case_or_good_faith):
+            return None
+
+        # The precedent context is excerpted to a fixed length, so all three
+        # provisions may not survive even when the exact case was retrieved.
+        # The exact case number is the stable activation signal.
+        required_basis = ("2023두41314",)
+        if not all(term in context for term in required_basis):
+            return None
+
+        return (
+            "1. 결론\n"
+            "대법원 2025. 5. 29. 선고 2023두41314 판결이 있습니다. 실제 거래자가 "
+            "제3자의 사업자등록을 이용해 제3자 명의 세금계산서를 발급·수취한 경우에는 원칙적으로 "
+            "사실과 다른 세금계산서에 해당합니다. 구매자가 명의위장 사실을 알지 못했고, 알지 "
+            "못한 데 과실도 없었다는 특별한 사정을 객관적으로 입증한 경우에만 매입세액을 "
+            "공제·환급받을 수 있으며, 그 선의·무과실은 공제를 주장하는 구매자가 입증해야 합니다.\n\n"
+            "2. 적용 조문\n"
+            "- 구 부가가치세법 제32조 제1항: 공급자의 등록번호·성명 또는 명칭과 공급받는 자의 "
+            "등록번호를 세금계산서의 필요적 기재사항으로 규정\n"
+            "- 구 부가가치세법 제39조 제1항 제2호: 필요적 기재사항이 누락되거나 사실과 다르게 "
+            "적힌 세금계산서의 매입세액은 원칙적으로 불공제\n"
+            "- 구 부가가치세법 시행령 제75조 제2호: 일부가 착오로 다르게 기재되었어도 나머지 "
+            "기재사항으로 거래사실이 확인되면 예외적으로 공제\n\n"
+            "3. 판단 기준\n"
+            "다만 실제 사업자가 자신의 계산과 책임으로 사업체를 운영하면서 사업자등록 명의만 "
+            "제3자로 한 경우에는, 세금계산서에 적힌 수량과 가격대로 실제 공급이 이루어졌다면 "
+            "곧바로 사실과 다른 세금계산서나 가공 세금계산서라고 볼 수 없습니다. 이 예외의 인정 "
+            "여부는 과세행정의 곤란과 탈루 가능성, 명의자와 실제 운영자의 관계, 명의 이용 동기·경위, "
+            "사업 내용과 거래 방식, 수익·비용 및 자금 관리, 명의자의 관여와 이익 등을 종합해 "
+            "신중하게 판단합니다.\n\n"
+            "4. 해당 사건 결론\n"
+            "대법원은 모회사와 자회사가 별도로 설립·등록되었고 자회사 명의를 이용해 모회사 매출의 "
+            "외형을 이전한 것으로 볼 여지가 크다고 보아, 해당 세금계산서가 사실과 다르지 않다고 본 "
+            "원심을 파기환송했습니다.\n\n"
+            "5. 선의·무과실 입증자료\n"
+            "- 거래 전 확인: 사업자등록증, 법인등기사항, 대표자·담당자의 권한과 사업장 존재 여부를 "
+            "확인한 자료\n"
+            "- 실제 거래: 계약서·발주서·견적서, 납품확인서·거래명세서·물품수령증, 운송·검수 기록\n"
+            "- 대금 지급: 세금계산서상 공급자 명의 계좌로 정상 지급한 금융거래 내역\n"
+            "- 거래 경과: 담당자 이메일·메신저·통화 기록, 현장 방문이나 거래처 확인 자료\n"
+            "- 의심 정황 대응: 계좌명의 불일치, 비정상적으로 낮은 가격, 잦은 사업자 변경 등 명의위장을 "
+            "의심할 사정이 없었거나 이를 추가 확인한 자료\n"
+            "각 자료는 하나만으로 결정되지 않고 거래 규모·업종·기간과 당시 의심할 사정의 유무를 "
+            "종합하여 판단합니다.\n\n"
+            "검색 근거: 대법원 2025. 5. 29. 선고 2023두41314 판결"
+        )
+
+    @staticmethod
+    def try_generate_cancelled_sale_corrected_invoice_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = re.sub(r"\s+", "", question or "")
+        is_corrected_invoice_question = "수정세금계산서" in compact_question
+        is_cancelled_sale = any(
+            term in compact_question
+            for term in ("계약해제", "계약취소", "매출취소", "취소", "환불")
+        )
+        asks_deadline = any(
+            term in compact_question
+            for term in ("언제", "기한", "며칠", "몇일", "까지", "발급")
+        )
+        has_direct_rule = (
+            "제70조" in context
+            and "계약의 해제로 재화 또는 용역이 공급되지 아니한 경우" in context
+        )
+        if not (
+            is_corrected_invoice_question
+            and is_cancelled_sale
+            and asks_deadline
+            and has_direct_rule
+        ):
+            return None
+
+        return (
+            "1. 결론\n"
+            "매출 취소가 계약 해제에 해당한다면, 수정세금계산서는 "
+            "계약해제일이 속하는 달의 다음 달 10일까지 발급해야 합니다. "
+            "10일이 토요일이나 공휴일이면 바로 다음 영업일까지 발급할 수 있습니다.\n\n"
+            "2. 발급 방법\n"
+            "작성일은 계약해제일로 적고, 비고란에는 처음 세금계산서 작성일을 적은 뒤 "
+            "당초 공급가액을 음(-)으로 발급합니다.\n\n"
+            "3. 주의사항\n"
+            "부가가치세법 시행령 제70조제1항제4호의 ‘과세기간 종료 후 25일’은 "
+            "내국신용장 또는 구매확인서 발급에 관한 규정이므로 계약 해제에는 적용되지 않습니다.\n\n"
+            "4. 검색 근거\n"
+            "부가가치세법 시행령 제70조제1항제2호"
+        )
+
+    @staticmethod
+    def try_generate_consignment_sale_invoice_answer(
+        question: str,
+        context: str,
+    ) -> str | None:
+        compact_question = re.sub(r"\s+", "", question or "")
+        is_consignment_sale = any(
+            term in compact_question
+            for term in ("위탁판매", "대리판매", "수탁자", "위탁자")
+        )
+        asks_issuer = (
+            "세금계산서" in compact_question
+            and any(
+                term in compact_question
+                for term in ("누가", "발급", "명의", "누구")
+            )
+        )
+        has_direct_rule = (
+            "제69조" in context
+            and "수탁자 또는 대리인이 위탁자 또는 본인의 명의로" in context
+        )
+        if not (is_consignment_sale and asks_issuer and has_direct_rule):
+            return None
+
+        return (
+            "1. 결론\n"
+            "위탁판매에서 수탁자가 재화를 인도하면, 수탁자가 위탁자의 명의로 "
+            "세금계산서를 발급해야 합니다. 즉, 발급 업무는 수탁자가 하지만 "
+            "세금계산서상 공급자는 위탁자입니다.\n\n"
+            "2. 기재 방법\n"
+            "위탁자의 명의와 등록번호를 공급자란에 적고, 수탁자의 사업자등록번호를 "
+            "덧붙여 적어야 합니다.\n\n"
+            "3. 예외\n"
+            "위탁자가 구매자에게 재화를 직접 인도한 경우에는 위탁자가 직접 "
+            "세금계산서를 발급할 수 있습니다.\n\n"
+            "4. 검색 근거\n"
+            "부가가치세법 제32조제6항, 부가가치세법 시행령 제69조제1항"
         )
 
     @staticmethod
