@@ -25,7 +25,6 @@ Ollama
 Streaming Response
 ```
 # 3. 주요 기능 및 개발 상태 
-## 주요 기능 및 개발 상태
 > 현재 개발 중인 프로젝트입니다.
 
 ### 구현 완료
@@ -61,18 +60,32 @@ Streaming Response
 - Redis
 - Ollama 0.30.7
 - LLM Model: `qwen3:4b`
-- Quantization: `Q4_K_M`
 
 FastAPI AI Service는 사용자 질문을 처리하기 위해 Spring Boot Backend의 검색 API와 Ollama 실행 환경이 필요합니다.
 
 ### 환경변수 
 ```
+SPRING_BASE_URL=http://localhost:8080
+
 RETRIEVAL_OLLAMA_BASE_URL=http://localhost:11434
 RETRIEVAL_OLLAMA_MODEL=qwen3:4b
 RETRIEVAL_REQUEST_TIMEOUT_SEC=120
 ```
 
 # 5. 실행 방법
+### 실행 전 준비
+전체 질의응답 기능을 사용하려면 다음 서비스가 먼저 실행되어 있어야 합니다.
+
+1. PostgreSQL
+2. Spring Boot Backend
+3. Ollama
+4. FastAPI AI Service
+
+### 관련 저장소
+
+- **FastAPI AI Service**: 현재 저장소
+- **Spring Boot Backend**: [TaxHelper-backend](https://github.com/mj-song00/TaxHelper-backend)
+
 ### 1. 가상환경 생성 
 ```
 cd app
@@ -147,4 +160,5 @@ LLM이 일반 지식을 이용해 근거 없는 답변을 생성하지 않도록
 - 재시도 전후 컨텍스트 길이 로깅
 
 ### 결과 
-컨텍스트가 모델 한도를 초과하더라도 즉시 실패하지 않고, 핵심 검색 근거를 축소해 한 번 재시도하도록 개선했습니다. <br> 재시도 여부와 축소 전후 길이를 로그로 남겨 오류 원인을 확인할 수 있게 했습니다.
+컨텍스트 초과 오류 발생 시 검색 근거를 60%로 축소하고 한 번만 재시도하도록 개선했습니다.<br>
+재시도 여부와 축소 전후 컨텍스트 길이를 로그로 남겨 오류 원인을 확인할 수 있게 했으며, 동일한 오류가 무한 반복되지 않도록 재시도 횟수를 제한했습니다.
