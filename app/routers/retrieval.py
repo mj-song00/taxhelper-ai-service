@@ -18,7 +18,6 @@ from app.schemas.retrieval import (
 )
 from app.services.chunk_client import ChunkSearchClient
 from app.services.chunk_search_service import ChunkSearchService
-from app.services.embedding_service import EmbeddingService
 from app.services.llm_service import LlmService
 from app.services.precedent_search_service import PrecedentSearchService
 
@@ -48,11 +47,6 @@ def log_chat_timing(
 
 
 @lru_cache
-def get_embedding_service() -> EmbeddingService:
-    return EmbeddingService()
-
-
-@lru_cache
 def get_chunk_search_service() -> ChunkSearchService:
     settings = get_settings()
     client = ChunkSearchClient(
@@ -66,7 +60,6 @@ def get_chunk_search_service() -> ChunkSearchService:
     return ChunkSearchService(
         client=client,
         candidate_size=settings.default_candidate_size,
-        embedding_service=get_embedding_service(),
     )
 
 
@@ -84,7 +77,6 @@ def get_precedent_search_service() -> PrecedentSearchService:
     return PrecedentSearchService(
         client=client,
         candidate_size=settings.default_candidate_size,
-        embedding_service=get_embedding_service(),
     )
 
 

@@ -5,7 +5,6 @@ import re
 from app.schemas.retrieval import Pagination, PrecedentChunk
 from app.services.chunk_client import ChunkSearchClient
 from app.services.chunk_search_service import ChunkSearchService
-from app.services.embedding_service import EmbeddingService
 
 
 class PrecedentSearchService:
@@ -125,28 +124,15 @@ class PrecedentSearchService:
         self,
         client: ChunkSearchClient,
         candidate_size: int,
-        embedding_service: EmbeddingService | None = None,
     ) -> None:
         self.client = client
         self.candidate_size = candidate_size
-        self.embedding_service = embedding_service
 
     async def retrieve_chunks(
         self,
         conditions: dict,
         top_k: int,
     ) -> tuple[list[PrecedentChunk], Pagination]:
-        query_embedding = None
-        if self.embedding_service is not None:
-            query_embedding = await self.embedding_service.embed_query(
-                conditions["rewritten_query"] or conditions["original_question"]
-            )
-            print(
-                f"[VECTOR_SEARCH] target=precedent enabled={query_embedding is not None} "
-                f"embedding_dim={len(query_embedding) if query_embedding else 0}",
-                flush=True,
-            )
-
         raw_chunks, page_info = await self.client.fetch_chunks(
             candidate_page=conditions.get("page", 1),
             candidate_size=conditions.get("size", self.candidate_size),
@@ -155,7 +141,6 @@ class PrecedentSearchService:
             rewritten_query=conditions["rewritten_query"],
             court_names=conditions["court_names"],
             case_numbers=conditions["case_numbers"],
-            query_embedding=query_embedding,
         )
 
         chunks = [self._to_chunk(item) for item in raw_chunks]

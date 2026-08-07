@@ -5,7 +5,6 @@ import re
 
 from app.schemas.retrieval import LawChunk, Pagination
 from app.services.chunk_client import ChunkSearchClient
-from app.services.embedding_service import EmbeddingService
 from app.services.legal_concepts import (
     build_weighted_terms,
     extract_legal_concepts,
@@ -365,11 +364,9 @@ class ChunkSearchService:
         self,
         client: ChunkSearchClient,
         candidate_size: int,
-        embedding_service: EmbeddingService | None = None,
     ) -> None:
         self.client = client
         self.candidate_size = candidate_size
-        self.embedding_service = embedding_service
 
     def build_search_conditions(self, question: str) -> dict:
         keywords = self.extract_keywords(question)
@@ -564,17 +561,6 @@ class ChunkSearchService:
         print("query =", conditions["rewritten_query"])
         print("law_names =", conditions["law_names"])
 
-        query_embedding = None
-        if self.embedding_service is not None:
-            query_embedding = await self.embedding_service.embed_query(
-                conditions["rewritten_query"] or conditions["original_question"]
-            )
-            print(
-                f"[VECTOR_SEARCH] target=law enabled={query_embedding is not None} "
-                f"embedding_dim={len(query_embedding) if query_embedding else 0}",
-                flush=True,
-            )
-
         supplemental_conditions = self.build_supplemental_conditions(conditions)
         search_requests = [
             self.client.fetch_chunks(
@@ -583,7 +569,6 @@ class ChunkSearchService:
                 law_names=conditions["law_names"],
                 keywords=conditions["keywords"],
                 rewritten_query=conditions["rewritten_query"],
-                query_embedding=query_embedding,
             ),
             *(
                 self.client.fetch_chunks(
@@ -592,7 +577,6 @@ class ChunkSearchService:
                     law_names=item["law_names"],
                     keywords=item["keywords"],
                     rewritten_query=item["rewritten_query"],
-                    query_embedding=query_embedding,
                 )
                 for item in supplemental_conditions
             ),
