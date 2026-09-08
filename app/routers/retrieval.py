@@ -13,13 +13,17 @@ from fastapi.responses import StreamingResponse
 
 from app.core.config import get_settings
 from app.schemas.retrieval import (
+    ChatJobRequest,
+    ChatJobResponse,
     ChatRequest,
     ChatResponse,
 )
+from app.services.chat_job_client import ChatJobClient
 from app.services.chunk_client import ChunkSearchClient
 from app.services.chunk_search_service import ChunkSearchService
 from app.services.llm_service import LlmService
 from app.services.precedent_search_service import PrecedentSearchService
+from app.services.rabbitmq_publisher import RabbitMQPublisher
 
 router = APIRouter(tags=["retrieval"])
 
@@ -85,11 +89,133 @@ def get_llm_service() -> LlmService:
     return LlmService()
 
 
+@lru_cache
+def get_chat_job_client() -> ChatJobClient:
+    settings = get_settings()
+    return ChatJobClient(
+        base_url=settings.spring_base_url,
+        jobs_path=settings.spring_chat_jobs_path,
+        timeout_sec=settings.request_timeout_sec,
+    )
+
+
+@lru_cache
+def get_rabbitmq_publisher() -> RabbitMQPublisher:
+    settings = get_settings()
+    return RabbitMQPublisher(
+        url=settings.rabbitmq_url,
+        queue_name=settings.rabbitmq_queue,
+    )
+
+
 def encode_sse(event: str, data: object) -> str:
     return (
         f"event: {event}\n"
         f"data: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
     )
+
+
+@router.post(
+    "/rabbitmq/test-publish",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Publish a RabbitMQ connection test message",
+)
+async def publish_rabbitmq_test() -> dict[str, str]:
+    job_id = str(uuid4())
+    try:
+        await get_rabbitmq_publisher().publish(
+            {
+                "job_id": job_id,
+                "message": "rabbitmq connection test",
+            }
+        )
+    except Exception as exc:
+        print(
+            f"[RABBITMQ] status=publish_failed job_id={job_id} "
+            f"error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="RabbitMQ publisher is unavailable.",
+        ) from exc
+
+    return {"job_id": job_id, "status": "published"}
+
+
+@router.post(
+    "/chat/jobs",
+    response_model=ChatJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Prepare and enqueue a chat job",
+)
+async def create_chat_job(
+    request: ChatJobRequest,
+    http_request: Request,
+    law_service: ChunkSearchService = Depends(get_chunk_search_service),
+    precedent_service: PrecedentSearchService = Depends(get_precedent_search_service),
+    chat_job_client: ChatJobClient = Depends(get_chat_job_client),
+    rabbitmq_publisher: RabbitMQPublisher = Depends(get_rabbitmq_publisher),
+) -> ChatJobResponse:
+    chat_request = ChatRequest(question=request.question, top_k=request.top_k)
+    request_id, total_started_at = start_chat_request(http_request, chat_request)
+    failure_message = "Chat job preparation failed."
+
+    try:
+        prepared = await prepare_chat(
+            chat_request,
+            request_id,
+            total_started_at,
+            law_service,
+            precedent_service,
+        )
+        sources = build_sources(
+            prepared.law_chunk_data,
+            prepared.precedent_chunk_data,
+        )
+
+        failure_message = "Prepared chat data storage failed."
+        await chat_job_client.save_prepared(
+            request.job_id,
+            prepared.context,
+            sources,
+        )
+        print(
+            f"[CHAT_JOB] job_id={request.job_id} phase=prepared",
+            flush=True,
+        )
+
+        failure_message = "RabbitMQ publish failed."
+        await rabbitmq_publisher.publish({"job_id": str(request.job_id)})
+
+        failure_message = "Chat job WAITING update failed."
+        await chat_job_client.mark_waiting(request.job_id)
+        print(
+            f"[CHAT_JOB] job_id={request.job_id} status=WAITING",
+            flush=True,
+        )
+    except Exception as exc:
+        try:
+            await chat_job_client.mark_failed(request.job_id, failure_message)
+        except Exception as status_exc:
+            print(
+                f"[CHAT_JOB] job_id={request.job_id} "
+                f"status=failed_update_error error={type(status_exc).__name__}",
+                flush=True,
+            )
+        print(
+            f"[CHAT_JOB] job_id={request.job_id} status=FAILED "
+            f"error={type(exc).__name__}",
+            flush=True,
+        )
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=failure_message,
+        ) from exc
+
+    return ChatJobResponse(job_id=request.job_id, status="WAITING")
 
 
 def compact_chunk(

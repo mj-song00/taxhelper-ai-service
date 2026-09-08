@@ -28,7 +28,7 @@ class ChunkSearchService:
 
     DOMAIN_HINTS = {
         "소득세": {
-            "프리랜서", "사업소득", "근로소득", "종합소득세", "원천징수",
+            "프리랜서", "사업소득", "근로소득", "종합소득세", "원천징수", "필요경비",
             "지급명세서", "인적공제", "연말정산", "인적용역",
             "교육비", "세액공제", "특별세액공제",
             "장기저당차입금", "장기주택저당차입금", "이자상환액", "주택자금", "주택자금공제", "특별소득공제",
@@ -55,6 +55,14 @@ class ChunkSearchService:
         },
     }
 
+    EXPLICIT_DOMAIN_HINTS = {
+        "사업소득", "근로소득", "종합소득세", "양도소득세",
+        "부가세", "부가가치세",
+        "법인", "법인세",
+        "개별소비세", "개별 소비세", "개소세",
+        "지방세", "취득세", "재산세", "등록면허세",
+    }
+
     TAX_KEYWORDS = {
         "소득세", "법인세", "부가가치세", "종합소득세", "원천징수",
         "세액공제", "세액감면", "가산세", "경정청구", "수정신고",
@@ -73,14 +81,12 @@ class ChunkSearchService:
     }
 
     TAX_SYNONYMS = {
+        "대손세액공제": ["부가가치세", "매출세액"],
         "공급가액": ["부가가치세 포함", "110분의 100", "110분의 10", "제29조"],
         "부가가치세 포함": ["공급가액", "110분의 100", "제29조"],
         "임대료": ["공급가액", "부가가치세 포함", "제29조"],
         "월세": ["받은 대가", "공급가액", "공급대가", "110분의 100", "부가가치세 포함", "제29조"],
         "부동산 임대": ["받은 대가", "공급가액", "공급대가", "110분의 100", "부가가치세 포함", "제29조"],
-        "리스": ["자동차의 구입과 임차", "비영업용 소형승용차", "경형승용자동차", "제39조", "제78조"],
-        "사업용 차량": ["자동차의 구입과 임차", "비영업용 소형승용차", "운수업", "자동차판매업", "제39조", "제78조"],
-        "차량": ["자동차의 구입과 임차", "비영업용 소형승용차", "경형승용자동차", "제39조", "제78조"],
         "폐업": ["남아 있는 재화", "잔존재화", "자기생산ㆍ취득재화", "제10조"],
         "재고": ["남아 있는 재화", "잔존재화", "자기생산ㆍ취득재화", "폐업"],
         "유종별": ["석유류", "휘발유", "경유", "등유", "중유", "프로판", "부탄"],
@@ -163,7 +169,7 @@ class ChunkSearchService:
     ]
 
     BAD_DEBT_ALLOWANCE_TERMS = {
-        "대손충당금", "대손금", "대손", "채권", "구상채권", "가지급금", "채무보증",
+        "대손충당금", "대손금", "채권", "구상채권", "가지급금", "채무보증",
     }
 
     BAD_DEBT_ALLOWANCE_QUERY_HINTS = [
@@ -287,8 +293,7 @@ class ChunkSearchService:
 
     OVERSEAS_STOCK_TERMS = {
         "미국 주식", "미국주식", "해외 주식", "해외주식", "외국 주식", "외국주식",
-        "국외 주식", "국외주식", "매매차익", "양도차익", "양도소득", "양도소득세",
-        "배당금", "배당소득", "금융소득",
+        "국외 주식", "국외주식",
     }
 
     OVERSEAS_STOCK_QUERY_HINTS = [
@@ -376,12 +381,18 @@ class ChunkSearchService:
                 keywords,
             )
         normalized_question = re.sub(r"\s+", "", question)
-        if any(term in normalized_question for term in ("공급가액", "부가가치세포함", "임대료", "월세", "부동산임대", "받은금액", "받은대가", "공급대가")):
+        if (
+            any(term in normalized_question for term in ("임대", "임대료", "월세", "부동산임대"))
+            and any(term in normalized_question for term in ("부가가치세", "부가세", "VAT", "vat", "공급가액", "공급대가", "부가가치세포함", "부가세포함", "별도로받지", "받은대가"))
+        ):
             keywords = self.prepend_unique(
                 ["공급가액", "받은 대가", "공급대가", "부가가치세 포함 여부 불분명", "110분의 100", "110분의 10", "부가가치세법 제29조"],
                 keywords,
             )
-        if any(term in normalized_question for term in ("리스", "사업용차", "사업용자동차", "차량", "승용차", "화물차")):
+        if (
+            any(term in normalized_question for term in ("리스", "사업용차", "사업용자동차", "차량", "승용차", "화물차"))
+            and any(term in normalized_question for term in ("부가가치세", "매입세액", "매입세액공제", "세금계산서", "공제받", "공제가능", "공제여부"))
+        ):
             keywords = self.prepend_unique(
                 ["자동차의 구입과 임차", "비영업용 소형승용차", "경형승용자동차", "운수업", "자동차판매업", "제39조", "제78조"],
                 keywords,
@@ -874,11 +885,13 @@ class ChunkSearchService:
         keywords: list[str] | None = None,
     ) -> bool:
         search_text = " ".join([question, *(keywords or [])])
-
-        return (
-            any(term in search_text for term in cls.BUSINESS_WITHHOLDING_TERMS)
-            and any(term in search_text for term in ("신고", "종합소득세", "종소세"))
+        has_business_income_context = any(
+            term in search_text
+            for term in ("사업소득", "프리랜서", "3.3", "3.3%")
         )
+        has_withholding_context = "원천징수" in search_text
+
+        return has_business_income_context and has_withholding_context
 
     @classmethod
     def is_overseas_stock_question(
@@ -1401,7 +1414,9 @@ class ChunkSearchService:
             for domain, hints in ChunkSearchService.DOMAIN_HINTS.items():
                 for hint in hints:
                     if hint in keyword or hint.lower() in lowered:
-                        domain_scores[domain] += 1
+                        domain_scores[domain] += (
+                            2 if hint in ChunkSearchService.EXPLICIT_DOMAIN_HINTS else 1
+                        )
 
         best_domain = max(domain_scores, key=domain_scores.get)
 

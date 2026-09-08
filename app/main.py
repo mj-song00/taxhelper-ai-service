@@ -3,11 +3,14 @@ from time import perf_counter
 from uuid import uuid4
 
 from fastapi import FastAPI
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.routers.retrieval import (
+    get_chat_job_client,
     get_chunk_search_service,
     get_llm_service,
     get_precedent_search_service,
+    get_rabbitmq_publisher,
     router as retrieval_router,
 )
 
@@ -81,10 +84,29 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(RequestTimingMiddleware)
     app.include_router(retrieval_router, prefix="/api/v1")
+    Instrumentator(excluded_handlers=["/metrics"]).instrument(app).expose(
+        app, include_in_schema=False
+    )
 
     @app.on_event("shutdown")
     async def shutdown_search_clients() -> None:
         await close_search_clients()
+        if get_rabbitmq_publisher.cache_info().currsize:
+            await get_rabbitmq_publisher().close()
+        if get_chat_job_client.cache_info().currsize:
+            await get_chat_job_client().close()
+
+    @app.on_event("startup")
+    async def connect_rabbitmq_publisher() -> None:
+        try:
+            await get_rabbitmq_publisher().connect()
+        except Exception as exc:
+            # Keep the existing synchronous API available while RabbitMQ is down.
+            print(
+                f"[RABBITMQ] status=connection_failed "
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     @app.on_event("startup")
     async def warm_up_ollama_model() -> None:

@@ -57,6 +57,12 @@ class LlmService:
         self.num_predict = settings.ollama_num_predict
         self.num_ctx = settings.ollama_num_ctx
         self.keep_alive = settings.ollama_keep_alive
+        self.ollama_max_concurrency = int(
+            os.getenv("OLLAMA_MAX_CONCURRENCY", "1")
+        )
+        if self.ollama_max_concurrency < 1:
+            raise ValueError("OLLAMA_MAX_CONCURRENCY must be at least 1")
+        self._ollama_semaphore = asyncio.Semaphore(self.ollama_max_concurrency)
         self.answer_cache_ttl_sec = settings.llm_answer_cache_ttl_sec
         self.answer_cache_max_entries = settings.llm_answer_cache_max_entries
         self._answer_cache: OrderedDict[tuple[str, str, str], tuple[float, str]] = OrderedDict()
@@ -292,28 +298,44 @@ class LlmService:
             print("========== END PAYLOAD ==========")
 
             content_parts: list[str] = []
-            ollama_started_at = perf_counter()
             first_token_sec: float | None = None
             final_event: dict = {}
-            async with self._client.stream("POST", url, json=payload) as response:
-                # Streaming responses are not buffered automatically. Read an error
-                # body before raise_for_status() so it remains available to the
-                # HTTPStatusError handler after the stream context is closed.
-                if response.is_error:
-                    await response.aread()
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line.strip():
-                        continue
-                    event = json.loads(line)
-                    piece = event.get("message", {}).get("content")
-                    if isinstance(piece, str) and piece:
-                        if first_token_sec is None:
-                            first_token_sec = perf_counter() - ollama_started_at
-                        content_parts.append(piece)
-                        yield piece
-                    if event.get("done") is True:
-                        final_event = event
+            semaphore_wait_started_at = perf_counter()
+            async with self._ollama_semaphore:
+                semaphore_wait_sec = perf_counter() - semaphore_wait_started_at
+                ollama_started_at = perf_counter()
+                print(
+                    f"[OLLAMA_CONCURRENCY] model={self.model} status=started "
+                    f"semaphore_wait_sec={semaphore_wait_sec:.3f} "
+                    f"max_concurrency={self.ollama_max_concurrency}",
+                    flush=True,
+                )
+                try:
+                    async with self._client.stream("POST", url, json=payload) as response:
+                        # Streaming responses are not buffered automatically. Read an error
+                        # body before raise_for_status() so it remains available to the
+                        # HTTPStatusError handler after the stream context is closed.
+                        if response.is_error:
+                            await response.aread()
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            if not line.strip():
+                                continue
+                            event = json.loads(line)
+                            piece = event.get("message", {}).get("content")
+                            if isinstance(piece, str) and piece:
+                                if first_token_sec is None:
+                                    first_token_sec = perf_counter() - ollama_started_at
+                                content_parts.append(piece)
+                                yield piece
+                            if event.get("done") is True:
+                                final_event = event
+                finally:
+                    print(
+                        f"[OLLAMA_CONCURRENCY] model={self.model} status=finished "
+                        f"ollama_elapsed_sec={perf_counter() - ollama_started_at:.3f}",
+                        flush=True,
+                    )
 
             total_sec = perf_counter() - ollama_started_at
             eval_count = int(final_event.get("eval_count") or 0)

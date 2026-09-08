@@ -16,11 +16,24 @@ class Settings(BaseSettings):
         default="/api/v1/chunks/prec-chunks",
         description="Spring endpoint path for paged precedent chunk retrieval.",
     )
+    spring_chat_jobs_path: str = Field(
+        default="/api/internal/chat/jobs",
+        description="Spring internal endpoint path for chat job updates.",
+    )
     default_top_k: int = Field(default=5, ge=1, le=20)
     default_candidate_size: int = Field(default=30, ge=20, le=500)
     request_timeout_sec: float = Field(default=120.0, gt=0)
     search_cache_ttl_sec: float = Field(default=300.0, ge=0)
     search_cache_max_entries: int = Field(default=256, ge=0, le=10_000)
+
+    rabbitmq_url: str = Field(
+        default="amqp://guest:guest@localhost/",
+        validation_alias="RABBITMQ_URL",
+    )
+    rabbitmq_queue: str = Field(
+        default="taxhelper.llm.jobs",
+        validation_alias="RABBITMQ_QUEUE",
+    )
 
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:4b-instruct-2507-q4_K_M"
