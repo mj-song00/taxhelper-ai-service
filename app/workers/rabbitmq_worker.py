@@ -84,7 +84,10 @@ async def main() -> None:
                             f"status_code={status_code}",
                             flush=True,
                         )
-                        await message.reject(requeue=False)
+                        retryable = status_code in {408, 429} or status_code >= 500
+                        if retryable:
+                            await asyncio.sleep(1)
+                        await message.reject(requeue=retryable)
                         continue
                     except httpx.RequestError as exc:
                         print(
@@ -92,7 +95,8 @@ async def main() -> None:
                             f"reason=job_lookup_failed error={type(exc).__name__}",
                             flush=True,
                         )
-                        await message.reject(requeue=False)
+                        await asyncio.sleep(1)
+                        await message.reject(requeue=True)
                         continue
 
                     job_status = job.get("status")
@@ -118,8 +122,35 @@ async def main() -> None:
                         await message.reject(requeue=False)
                         continue
 
+                    # Only a confirmed claim permits generation or a failure callback.
+                    # A timeout may mean the server claimed the job but lost the response.
                     try:
                         await chat_job_client.mark_processing(job_id)
+                    except httpx.HTTPStatusError as exc:
+                        status_code = exc.response.status_code
+                        if status_code == 409:
+                            await message.ack()
+                        else:
+                            retryable = status_code in {408, 429} or status_code >= 500
+                            if retryable:
+                                await asyncio.sleep(1)
+                            await message.reject(requeue=retryable)
+                        print(
+                            f"[CHAT_JOB] job_id={job_id} phase=claim_failed status_code={status_code}",
+                            flush=True,
+                        )
+                        continue
+                    except httpx.RequestError as exc:
+                        await asyncio.sleep(1)
+                        await message.reject(requeue=True)
+                        print(
+                            f"[CHAT_JOB] job_id={job_id} phase=claim_uncertain "
+                            f"error={type(exc).__name__}",
+                            flush=True,
+                        )
+                        continue
+
+                    try:
                         print(
                             f"[CHAT_JOB] job_id={job_id} status=PROCESSING",
                             flush=True,
@@ -153,7 +184,7 @@ async def main() -> None:
                             await message.reject(requeue=False)
                             continue
                         print(
-                            f"[CHAT_JOB] job_id={job_id} status=FAILED "
+                            f"[CHAT_JOB] job_id={job_id} phase=failure_notified "
                             f"error={type(exc).__name__}",
                             flush=True,
                         )
