@@ -1,32 +1,46 @@
 # 1. 프로젝트 소개 
 TaxHelper는 국가법령정보센터의 법령 및 판례 데이터를 검색하고, 검색된 근거를 바탕으로 답변을 생성하는 RAG 기반 세법 질의응답 서비스입니다.
 
-이 저장소는 사용자의 자연어 질문을 분석하고, Spring Boot 검색 API를 호출한 뒤 검색 결과를 재정렬하여 Ollama 기반 답변을 생성하는 FastAPI AI Service입니다.
+이 저장소는 사용자의 자연어 질문을 분석하고, Spring Boot 검색 API를 호출해 검색 결과를 재정렬하며, 
+RabbitMQ와 Worker를 이용해 Ollama 답변 생성을 비동기로 처리하는 FastAPI AI Service입니다.
 
 # 2. 시스템 구성
 ```text
 사용자 질문
     ↓
+Spring Boot Backend
+- 질의 작업 요청
+    ↓
 FastAPI AI Service
 - 자연어 질문 분석
 - 법령명·세목·핵심 키워드 추출
     ↓
-Spring Boot Backend
+Spring Boot Backend · PostgreSQL
 - 법령·판례 검색
-- 검색 후보 반환
+- 작업 정보와 검색 근거 저장
     ↓
 FastAPI AI Service
 - 검색 결과 재정렬
 - LLM 컨텍스트 구성
+- job_id를 RabbitMQ에 발행
     ↓
-Ollama
-- 검색 근거 기반 답변 생성
+RabbitMQ
+- LLM 작업 대기
     ↓
-JSON / SSE Response
-- 답변 및 법령·판례 출처 반환
+FastAPI Worker
+- 작업 상태를 PROCESSING으로 변경
+- Ollama 기반 답변 생성
+- 답변 저장 완료 후 메시지 ack
+    ↓
+Spring Boot Backend · PostgreSQL
+- COMPLETED/FAILED 상태와 결과 저장
+    ↓
+사용자
+- Spring Boot 작업 상태 및 결과 저장 API 연동
 ```
+
 # 3. 주요 기능 및 개발 상태 
-> 현재 개발 중인 프로젝트입니다.
+> 핵심 기능 구현과 동시 요청 처리 구조 개선을 완료했으며, 추가 기능 개발은 보류 중입니다.
 
 ### 구현 완료
 - 사용자 자연어 질문 분석
@@ -42,17 +56,16 @@ JSON / SSE Response
 - 검색 결과 및 LLM 답변 인메모리 TTL 캐시
 - 서버 시작 시 Ollama 워밍업
 - 검색·모델 로드·첫 토큰·답변 생성 구간별 로깅
+- RabbitMQ 기반 LLM 작업 비동기 처리
+- `job_id` 기반 작업 발행 및 Worker 소비
+- `PREPARING → WAITING → PROCESSING → COMPLETED/FAILED` 상태 관리
+- Worker 1개와 `prefetch_count=1`을 이용한 순차 처리
+- 답변과 작업 상태 저장 완료 후 RabbitMQ 메시지 수동 ack
+- 작업 상태 및 완료 결과 조회
 
-### 진행 중
-- 자연어 질문과 법령 표현 사이의 검색 정확도 개선
-- 대표 실패 질문 기반 회귀 테스트 확장
-- 답변 정확도 및 검색 품질 평가 데이터 구축
-- 답변 형식과 문체의 일관성 개선
-
-### 개발 예정
-- 서비스 배포
-- 검색 및 답변 품질의 정량 평가 자동화
-- 인메모리 캐시의 외부 캐시 전환 검토
+### 후속 개선 과제
+- Worker 장애 시 메시지 재전달 및 작업 상태 복구 검증
+- 중복 메시지 처리 방지
 
 # 4. 실행 환경
 ### 구성 요소
@@ -61,8 +74,11 @@ JSON / SSE Response
 - Spring Boot Backend
 - Ollama 
 - LLM Model: `qwen3:4b`
+- RabbitMQ
+- FastAPI API Server
+- FastAPI Worker
 
-FastAPI AI Service는 사용자 질문을 처리하기 위해 Spring Boot Backend의 검색 API와 Ollama 실행 환경이 필요합니다.
+> 전체 질의응답 기능을 실행하려면 Spring Boot Backend, PostgreSQL, RabbitMQ, Ollama, FastAPI API Server와 Worker가 필요합니다.
 
 ### 환경변수 
 ```env
@@ -71,16 +87,21 @@ RETRIEVAL_SPRING_BASE_URL=http://localhost:8080
 RETRIEVAL_OLLAMA_BASE_URL=http://localhost:11434
 RETRIEVAL_OLLAMA_MODEL=qwen3:4b
 RETRIEVAL_REQUEST_TIMEOUT_SEC=120
+
+RABBITMQ_URL=amqp://guest:guest@localhost/
+RABBITMQ_QUEUE=taxhelper.llm.jobs
 ```
 
 # 5. 실행 방법
 ### 실행 전 준비
 전체 질의응답 기능을 사용하려면 다음 서비스가 먼저 실행되어 있어야 합니다.
 
-1. PostgreSQL
-2. Spring Boot Backend
-3. Ollama
-4. FastAPI AI Service
+1. PostgreSQL 실행
+2. Spring Boot Backend 실행
+3. RabbitMQ 실행
+4. Ollama 실행 및 모델 준비
+5. FastAPI API Server 실행
+6. FastAPI Worker 실행
 
 ### 관련 저장소
 
@@ -97,6 +118,7 @@ RETRIEVAL_REQUEST_TIMEOUT_SEC=120
 
 ```bash
 ollama pull qwen3:4b
+```
 
 ### 1. 저장소 복제
 
@@ -122,6 +144,11 @@ pip install -r requirements.txt
 ```bash
 uvicorn app.main:app --reload
 ```
+### 6. FastAPI Worker 실행
+FastAPI API Server와 별도의 터미널에서 실행합니다.
+```bash
+python -m app.workers.rabbitmq_worker
+```
 
 # 6. 기술 스택
 ### Backend
@@ -133,7 +160,7 @@ uvicorn app.main:app --reload
 
 ### LLM
 - Ollama
-- Model: `qwen3:4b-instruct-2507-q4_K_M`
+- Base Model: `qwen3:4b-instruct-2507`
 - Quantization: `Q4_K_M`
 
 ### API
@@ -146,15 +173,31 @@ uvicorn app.main:app --reload
 2. 질문에서 법령명, 세목 및 핵심 법률 개념을 추출합니다.
 3. 검색 조건을 생성하여 Spring Boot 검색 API를 호출합니다.
 4. 반환된 법령·판례 후보를 질문과의 관련도에 따라 재정렬합니다.
-5. 상위 검색 결과를 LLM 컨텍스트로 구성합니다.
-6. Ollama에 검색 근거와 질문을 전달합니다.
-7. 요청한 API에 따라 일반 JSON 또는 SSE 스트리밍으로 답변과 출처를 반환합니다.
+5. 상위 검색 결과로 LLM 컨텍스트를 구성하고 작업 정보를 저장합니다.
+6. `job_id`를 RabbitMQ의 `taxhelper.llm.jobs` 큐에 발행합니다.
+7. Worker가 메시지를 가져와 작업 상태를 `PROCESSING`으로 변경합니다.
+8. Ollama에 질문과 검색 근거를 전달하여 답변을 생성합니다.
+9. 답변과 `COMPLETED` 상태를 Spring Boot를 통해 PostgreSQL에 저장합니다.
+10. 저장이 완료된 후 RabbitMQ 메시지를 ack합니다.
+11. 사용자는 작업 조회 API를 통해 상태와 완료된 답변을 확인합니다.
 
 # 8. 기술적 고민과 의사결정
 ### Spring Boot와 FastAPI 역할 분리
 법령 데이터 관리와 AI 처리 로직은 사용하는 기술과 변경 주기가 다르다고 판단했습니다.<br>
 Spring Boot는 법령·판례 데이터 수집, 관계형 데이터 저장 및 검색 API를 담당하고, FastAPI는 자연어 질문 분석, 검색 결과 재정렬 및 LLM 답변 생성을 담당하도록 역할을 분리했습니다.<br>
 이를 통해 검색 데이터 관리와 AI 처리 로직을 독립적으로 수정하고 실험할 수 있도록 구성했습니다.
+
+### Semaphore에서 RabbitMQ 기반 비동기 처리로 전환
+
+로컬 Ollama의 동시 실행을 제한하기 위해 Semaphore를 적용했지만, 후속 요청이 HTTP 연결을 유지한 채 앞선 작업의 완료를 기다리면서 Spring Boot의 read timeout을 초과했습니다.
+
+HTTP 요청과 LLM 실행을 분리하기 위해 API Server는 검색과 작업 등록 후 `job_id`를 RabbitMQ에 발행하고, 별도 Worker가 Ollama 호출과 결과 저장을 처리하도록 변경했습니다. 
+로컬 Ollama의 처리 특성을 고려해 Worker 1개, `prefetch_count=1`, Semaphore 1을 유지했습니다.
+
+이를 통해 LLM 처리시간 자체를 단축하지는 않았지만, 장시간 실행되는 LLM 작업이 HTTP 타임아웃으로 실패하지 않고 큐에서 대기한 뒤 처리되도록 구조를 변경했습니다.
+
+> 전체 동시 요청 테스트와 측정 결과는 Spring Boot Backend README에서 확인할 수 있습니다.
+
 
 ### 검색 근거 기반 답변 생성
 LLM이 일반 지식을 이용해 근거 없는 답변을 생성하지 않도록 검색된 법령과 판례만 사용하도록 시스템 프롬프트를 구성했습니다.<br>
