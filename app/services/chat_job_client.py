@@ -43,22 +43,40 @@ class ChatJobClient:
         )
         response.raise_for_status()
 
-    async def mark_processing(self, job_id: UUID) -> None:
+    async def mark_processing(self, job_id: UUID, attempt_id: UUID) -> dict:
         response = await self._client.put(
             f"{self.base_url}{self.jobs_path}/{job_id}/processing",
+            json={"attemptId": str(attempt_id)},
         )
         response.raise_for_status()
 
-    async def mark_completed(self, job_id: UUID, answer: str) -> None:
+        return response.json()
+
+    async def heartbeat(self, job_id: UUID, attempt_id: UUID) -> None:
+        response = await self._client.put(
+            f"{self.base_url}{self.jobs_path}/{job_id}/heartbeat",
+            json={"attemptId": str(attempt_id)},
+        )
+        response.raise_for_status()
+
+    async def mark_completed(self, job_id: UUID, answer: str, attempt_id: UUID) -> None:
         response = await self._client.put(
             f"{self.base_url}{self.jobs_path}/{job_id}/completed",
-            json={"answer": answer},
+            json={"answer": answer, "attemptId": str(attempt_id)},
         )
         response.raise_for_status()
 
-    async def mark_failed(self, job_id: UUID, error_message: str) -> None:
+    async def mark_failed(self, job_id: UUID, error_message: str, attempt_id: UUID | None = None) -> None:
         response = await self._client.put(
             f"{self.base_url}{self.jobs_path}/{job_id}/failed",
-            json={"errorMessage": error_message},
+            json={"errorMessage": error_message, "attemptId": str(attempt_id) if attempt_id else None},
         )
         response.raise_for_status()
+
+    async def recover(self, after_id: int, limit: int) -> dict:
+        response = await self._client.post(
+            f"{self.base_url}{self.jobs_path}/recovery",
+            params={"afterId": after_id, "limit": limit},
+        )
+        response.raise_for_status()
+        return response.json()

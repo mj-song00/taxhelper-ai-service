@@ -7,7 +7,8 @@ from aio_pika.abc import AbstractRobustChannel, AbstractRobustConnection
 
 
 class RabbitMQPublisher:
-    def __init__(self, url: str, queue_name: str) -> None:
+    def __init__(self, url: str, queue_name: str, dlq_name: str | None = None) -> None:
+        self.dlq_name = dlq_name
         self.url = url
         self.queue_name = queue_name
         self.connection: AbstractRobustConnection | None = None
@@ -21,6 +22,8 @@ class RabbitMQPublisher:
                 on_return_raises=True,
             )
             await channel.declare_queue(self.queue_name, durable=True)
+            if self.dlq_name:
+                await channel.declare_queue(self.dlq_name, durable=True)
         except BaseException:
             await connection.close()
             raise
@@ -38,20 +41,24 @@ class RabbitMQPublisher:
         self.connection = None
         self.channel = None
 
-    async def publish(self, payload: dict[str, str]) -> None:
+    async def publish(self, payload: dict[str, str], *, dead_letter: bool = False) -> None:
         if self.channel is None or self.channel.is_closed:
             raise RuntimeError("RabbitMQ publisher is not connected")
 
+        target = self.dlq_name if dead_letter else self.queue_name
+        if not target:
+            raise RuntimeError("DLQ is not configured")
         await self.channel.default_exchange.publish(
             aio_pika.Message(
                 body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 content_type="application/json",
                 delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
             ),
-            routing_key=self.queue_name,
+            routing_key=target,
+            timeout=5,
             mandatory=True,
         )
         print(
-            f"[RABBITMQ] status=published job_id={payload['job_id']}",
+            f"[RABBITMQ] status=published queue={target} job_id={payload.get('job_id', 'invalid')}",
             flush=True,
         )

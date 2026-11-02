@@ -35,6 +35,16 @@ class Settings(BaseSettings):
         validation_alias="RABBITMQ_QUEUE",
     )
 
+    job_recovery_interval_sec: float = Field(default=30.0, gt=0)
+    job_recovery_batch_size: int = Field(default=100, ge=1, le=100)
+    rabbitmq_dlq: str = Field(default="taxhelper.llm.jobs.dlq", validation_alias="RABBITMQ_DLQ")
+
+    job_api_attempts: int = Field(default=3, ge=1, le=10)
+    job_api_timeout_sec: float = Field(default=5.0, gt=0, le=30)
+    job_retry_delay_sec: float = Field(default=1.0, ge=0, le=30)
+    job_heartbeat_sec: float = Field(default=15.0, gt=0)
+    job_max_runtime_sec: float = Field(default=1800.0, gt=0)
+
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:4b-instruct-2507-q4_K_M"
     ollama_max_context_chars: int = Field(default=3000, ge=1000, le=20_000)
