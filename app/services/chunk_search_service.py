@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import math
+from pathlib import Path
 import re
 
 from app.schemas.retrieval import LawChunk, Pagination
@@ -9,6 +13,77 @@ from app.services.legal_concepts import (
     build_weighted_terms,
     extract_legal_concepts,
     infer_required_roles,
+)
+
+
+def _load_law_name_catalog(path: Path) -> tuple[str, ...]:
+    """Load and validate the versioned catalog before search is available."""
+    try:
+        catalog = json.loads(path.read_text(encoding="utf-8"))
+        if type(catalog["schema_version"]) is not int or catalog["schema_version"] != 1:
+            raise ValueError("unsupported schema_version")
+        if catalog["catalog_version"] != "law_names_catalog_v1":
+            raise ValueError("unsupported catalog_version")
+        identity = catalog["integrity"]["source_identity"]
+        identity_keys = {"engine", "database", "schema", "table", "column"}
+        if not isinstance(identity, dict) or set(identity) != identity_keys:
+            raise ValueError("invalid source_identity")
+        if any(not isinstance(value, str) or not value.strip() for value in identity.values()):
+            raise ValueError("invalid source_identity values")
+        if identity != {key: catalog["source"][key] for key in identity_keys}:
+            raise ValueError("source_identity mismatch")
+        if (identity["engine"], identity["schema"], identity["table"], identity["column"]) != (
+            "PostgreSQL", "public", "laws", "name"
+        ):
+            raise ValueError("unexpected catalog source")
+        names = catalog["law_names"]
+        if not isinstance(names, list) or any(not isinstance(name, str) or not name.strip() for name in names):
+            raise ValueError("invalid law_names")
+        if any(type(catalog[key]) is not int or catalog[key] != 419 for key in ("source_row_count", "name_count")) or len(names) != 419:
+            raise ValueError("invalid v1 catalog count")
+        if len(set(names)) != len(names):
+            raise ValueError("duplicate law names")
+        compact = [re.sub(r"\s+", "", name) for name in names]
+        if len(set(compact)) != len(compact):
+            raise ValueError("whitespace normalization collision")
+        if names != sorted(names, key=lambda name: (-len(re.sub(r"\s+", "", name)), name)):
+            raise ValueError("invalid catalog ordering")
+        if not isinstance(catalog["ordering"], dict) or not isinstance(catalog["normalization"], dict):
+            raise ValueError("invalid catalog metadata")
+        if catalog["normalization"].get("original_names_preserved") is not True or catalog["normalization"].get("use_normalized_names_as_canonical") is not False:
+            raise ValueError("canonical names must be preserved")
+        payload = {key: catalog[key] for key in (
+            "schema_version", "catalog_version", "source_row_count", "name_count",
+            "ordering", "normalization", "law_names"
+        )}
+        payload["source_identity"] = identity
+        digest = hashlib.sha256(json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+        if catalog["integrity"]["algorithm"] != "SHA-256" or digest != catalog["integrity"]["content_sha256"]:
+            raise ValueError("content_sha256 mismatch")
+        return tuple(names)
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"Cannot initialize canonical law catalog: {path} ({type(exc).__name__})") from exc
+
+
+_CANONICAL_LAW_NAMES = _load_law_name_catalog(
+    Path(__file__).resolve().parents[1] / "data" / "law_names_catalog_v1.json"
+)
+_CANONICAL_LAW_NAME_SET = frozenset(_CANONICAL_LAW_NAMES)
+_LAW_NAME_DELIMITER = r"(?=$|[\s.,;:!?()\[\]{}<>「」『』·])"
+_LAW_NAME_PARTICLE = r"(?:상(?:의|으로)?|에서(?:는)?|에(?:서는|서|따라|따른)?|으로(?:서|써)?|의|은|는|이|가|을|를|과|와)"
+_LAW_NAME_END = re.compile(
+    r"(?=$|[\s.,;:!?()\[\]{}<>「」『』·]|" + _LAW_NAME_PARTICLE + _LAW_NAME_DELIMITER + ")"
+)
+_CANONICAL_LAW_PATTERN = re.compile(
+    r"(?<![0-9A-Za-z가-힣])(?:"
+    + "|".join(
+        "(?P<L" + str(index) + ">"
+        + r"[ \t]*".join(re.escape(part) for part in name.split()) + ")"
+        for index, name in enumerate(_CANONICAL_LAW_NAMES)
+    )
+    + ")" + _LAW_NAME_END.pattern
 )
 
 
@@ -28,7 +103,7 @@ class ChunkSearchService:
 
     DOMAIN_HINTS = {
         "소득세": {
-            "프리랜서", "사업소득", "근로소득", "종합소득세", "원천징수", "필요경비",
+            "프리랜서", "사업소득", "근로소득", "종합소득세", "종합소득", "원천징수", "필요경비",
             "지급명세서", "인적공제", "연말정산", "인적용역",
             "교육비", "세액공제", "특별세액공제",
             "장기저당차입금", "장기주택저당차입금", "이자상환액", "주택자금", "주택자금공제", "특별소득공제",
@@ -56,7 +131,7 @@ class ChunkSearchService:
     }
 
     EXPLICIT_DOMAIN_HINTS = {
-        "사업소득", "근로소득", "종합소득세", "양도소득세",
+        "사업소득", "근로소득", "종합소득세", "종합소득", "양도소득세",
         "부가세", "부가가치세",
         "법인", "법인세",
         "개별소비세", "개별 소비세", "개소세",
@@ -514,9 +589,37 @@ class ChunkSearchService:
         if self.is_income_splitting_question(question):
             tax_domain = "소득세"
 
-        law_names = self.extract_law_names(question)
-        if not law_names:
+        # Scope expansion uses tax names in the original question, not expanded keywords.
+        explicit_domain_positions: dict[str, int] = {}
+        for domain, domain_hints in self.DOMAIN_HINTS.items():
+            explicit_hints = (domain_hints | {domain}) & (self.EXPLICIT_DOMAIN_HINTS | {domain})
+            for hint in explicit_hints:
+                if not hint.endswith("세"):
+                    continue
+                pattern = r"[ \t]*".join(re.escape(part) for part in hint.split())
+                match = re.search(pattern, question)
+                if match is not None:
+                    explicit_domain_positions[domain] = min(
+                        match.start(), explicit_domain_positions.get(domain, match.start())
+                    )
+        explicit_tax_domains = sorted(explicit_domain_positions, key=explicit_domain_positions.get)
+
+        extracted_law_names = self.extract_law_names(question)
+        canonical_law_names = [name for name in extracted_law_names if name in _CANONICAL_LAW_NAME_SET]
+        unresolved_law_names = [name for name in extracted_law_names if name not in _CANONICAL_LAW_NAME_SET]
+        # Explicit unresolved names keep the existing restricted search scope.
+        if canonical_law_names or unresolved_law_names:
+            law_names = extracted_law_names
+        elif len(explicit_tax_domains) > 1:
+            law_names = []
+        else:
             law_names = self.infer_law_names(tax_domain)
+        if len(explicit_tax_domains) > 1:
+            for domain in explicit_tax_domains:
+                domain_laws = self.infer_law_names(domain)
+                if domain_laws and not any(name in domain_laws for name in law_names):
+                    # Unspecified subordinate legislation is not added for every domain.
+                    law_names = self.deduplicate_keep_order(law_names + [domain_laws[0]])
         if self.is_income_splitting_question(question):
             law_names = self.prepend_unique(
                 ["소득세법", "소득세법 시행령"],
@@ -547,7 +650,7 @@ class ChunkSearchService:
             article_numbers=article_numbers,
         )
 
-        return {
+        conditions = {
             "original_question": question,
             "intent": intent,
             "tax_domain": tax_domain,
@@ -560,6 +663,13 @@ class ChunkSearchService:
             "article_numbers": article_numbers,
             "rewritten_query": rewritten_query,
         }
+
+        if len(explicit_tax_domains) > 1:
+            conditions["explicit_tax_domains"] = explicit_tax_domains
+            conditions["catalog_missing_law_names"] = [
+                name for name in law_names if name not in _CANONICAL_LAW_NAME_SET
+            ]
+        return conditions
 
     async def retrieve_chunks(
         self,
@@ -622,6 +732,7 @@ class ChunkSearchService:
             top_k=top_k,
             concepts=conditions.get("concepts", []),
             required_roles=conditions.get("required_roles", []),
+            explicit_tax_domains=conditions.get("explicit_tax_domains", []),
         )
 
         coverage = self.evaluate_concept_coverage(
@@ -1452,19 +1563,22 @@ class ChunkSearchService:
 
     @staticmethod
     def extract_law_names(question: str) -> list[str]:
-        matches = re.findall(r"[가-힣A-Za-z]+(?:법|시행령|시행규칙)", question)
-
-        unique: list[str] = []
-        seen: set[str] = set()
-
-        for match in matches:
-            if match in seen:
+        canonical_matches = list(_CANONICAL_LAW_PATTERN.finditer(question))
+        positioned = [
+            (match.start(), _CANONICAL_LAW_NAMES[int(match.lastgroup[1:])])
+            for match in canonical_matches
+        ]
+        for match in re.finditer(r"[가-힣A-Za-z]+(?:법|시행령|시행규칙)", question):
+            if any(full.start() <= match.start() and match.end() <= full.end() for full in canonical_matches):
                 continue
-
-            seen.add(match)
-            unique.append(match)
-
-        return unique
+            if match.start() and re.match(r"[0-9A-Za-z가-힣]", question[match.start() - 1]):
+                continue
+            if not _LAW_NAME_END.match(question, match.end()):
+                continue
+            # DB absence alone does not establish that an explicit name is invalid.
+            positioned.append((match.start(), match.group()))
+        positioned.sort(key=lambda item: item[0])
+        return ChunkSearchService.deduplicate_keep_order([name for _, name in positioned])
 
     @staticmethod
     def extract_article_numbers(question: str) -> list[str]:
@@ -1544,6 +1658,7 @@ class ChunkSearchService:
         top_k: int,
         concepts: list[dict] | None = None,
         required_roles: list[str] | None = None,
+        explicit_tax_domains: list[str] | None = None,
     ) -> list[LawChunk]:
         concepts = concepts or []
         required_role_set = set(required_roles or [])
@@ -2077,6 +2192,192 @@ class ChunkSearchService:
             for score, chunk in scored
             if score > 0 and not ChunkSearchService.is_deleted_chunk(chunk)
         ]
+
+        requirement_facets: list[dict] = []
+        facet_scores: dict[str, list[float]] = {}
+        selection_trace: list[dict] = []
+        domains = ChunkSearchService.deduplicate_keep_order(explicit_tax_domains or [])
+        if len(ranked) > top_k:
+            # Requirements use the original question, never expanded search keywords.
+            # Consume the whole canonical name and its particle before tokenization.
+            law_spans = list(_CANONICAL_LAW_PATTERN.finditer(query_text))
+            clean_question = query_text
+            for match in reversed(law_spans):
+                particle = re.match(_LAW_NAME_PARTICLE + _LAW_NAME_DELIMITER, query_text[match.end():])
+                end = match.end() + (particle.end() if particle else 0)
+                clean_question = clean_question[:match.start()] + " " * (end - match.start()) + clean_question[end:]
+            # A separate instruction excluding a scope is not positive evidence.
+            clean_question = re.sub(
+                r"(?<=[.?!])[^.?!]*(?:제외합니다|제외해 주세요|제외해주세요)[.?!]?",
+                lambda match: " " * len(match.group()), clean_question,
+            )
+            clauses: list[tuple[str, list[str]]] = []
+            if len(domains) > 1:
+                anchors: list[tuple[int, int, str]] = []
+                for domain in domains:
+                    family = ChunkSearchService.infer_law_names(domain)
+                    for match in law_spans:
+                        if _CANONICAL_LAW_NAMES[int(match.lastgroup[1:])] in family:
+                            anchors.append((match.start(), match.end(), domain))
+                    hints = (ChunkSearchService.DOMAIN_HINTS.get(domain, set()) | {domain}) & (
+                        ChunkSearchService.EXPLICIT_DOMAIN_HINTS | {domain}
+                    )
+                    for hint in hints:
+                        if not hint.endswith("세"):
+                            continue
+                        pattern = r"[ \t]*".join(re.escape(part) for part in hint.split())
+                        for match in re.finditer(pattern, query_text):
+                            if not any(start <= match.start() < end for start, end, _ in anchors):
+                                particle = re.match(_LAW_NAME_PARTICLE + _LAW_NAME_DELIMITER, query_text[match.end():])
+                                end = match.end() + (particle.end() if particle else 0)
+                                anchors.append((match.start(), end, domain))
+                anchors.sort()
+                shared_context = clean_question[:anchors[0][0]] if anchors else ""
+                # A negated premise is not positive relevance evidence. Without a
+                # scope-aware negation model, do not spread it into every facet.
+                if re.search(r"아닌|않는|아니하는|없(?:다고|는|을)|아니라고", shared_context):
+                    shared_context = ""
+                for index, (start, end, domain) in enumerate(anchors):
+                    stop = anchors[index + 1][0] if index + 1 < len(anchors) else len(query_text)
+                    clauses.append((clean_question[end:stop] + " " + shared_context,
+                                    ChunkSearchService.infer_law_names(domain)))
+            elif law_names:
+                # A coordination is necessary, but not sufficient, for same-law facets.
+                # Do not infer several requirements from every ordinary single question.
+                families = [family for family in ChunkSearchService.DOMAIN_TO_LAWS.values()
+                            if set(law_names).issubset(family)]
+                family = families[0] if families else law_names if len(law_names) == 1 else []
+                if family:
+                    parts = re.split(r"(?<=[가-힣])(?:과|와)(?=\s)|[,;]\s*(?:그리고|또한)\s+|\s+(?:및|그리고|또한)\s+", clean_question)
+                    if len(parts) > 1 and all(
+                        re.search(r"기준|시기|기한|제한|요건|원칙|범위|의무", part) for part in parts
+                    ):
+                        clauses = [(part, family) for part in parts]
+
+            # Discourse, particles and request verbs carry no evidential meaning.
+            # Keep this local to reranking; search keywords and search scope are unchanged.
+            discourse = {
+                "각각", "서로", "각", "여러", "차례", "이내", "대해", "대하여", "대한", "관련",
+                "해당", "여부", "경우", "무엇", "어떤", "어떻게", "알려", "주세요", "확인",
+                "싶습니다", "싶습", "대상", "아닌", "있고", "규정", "원칙", "기준", "범위", "판단", "판단하", "판단하나",
+                "적용", "적용하", "적용되", "따라", "법에서", "법상", "에서는", "에서", "으로",
+            }
+            term_sets: list[tuple[list[str], list[str]]] = []
+            facet_term_scores: dict[str, list[dict[str, float]]] = {}
+            tax_labels = {hint for hints in ChunkSearchService.DOMAIN_HINTS.values()
+                          for hint in hints if hint.endswith("세")}
+            tax_labels.update(label for name in law_names for label in re.findall(r"[가-힣]+세", name))
+            for text, family in clauses:
+                terms = []
+                # Reuse the matched concept's surface, without expanding a filing
+                # request into other duties such as payment or unrelated deadlines.
+                legal_terms = [value for concept in extract_legal_concepts(text)
+                               for value in ChunkSearchService.extract_keywords(concept.get("surface", ""))]
+                for term in ChunkSearchService.extract_keywords(text) + legal_terms:
+                    term = re.sub(r"(?:하|되)$", "", term.lower())
+                    if len(term) < 2 or term in discourse or term in tax_labels or term in _CANONICAL_LAW_NAME_SET:
+                        continue
+                    if re.fullmatch(r"제?\d+(?:조|항|호).*", term):
+                        continue
+                    terms.append(term)
+                term_sets.append((ChunkSearchService.deduplicate_keep_order(terms), family))
+            document_texts = {
+                chunk.chunk_id: ((chunk.title or "").lower(), (chunk.content or "").lower())
+                for chunk in ranked
+            }
+            for index, (terms, family) in enumerate(term_sets):
+                other_terms = {term for other, (values, _) in enumerate(term_sets) if other != index for term in values}
+                core_terms = [term for term in terms if term not in other_terms]
+                if not core_terms:
+                    continue
+                weights: dict[str, float] = {}
+                for term in terms:
+                    frequency = sum(term in title or term in content for title, content in document_texts.values())
+                    if frequency:
+                        weights[term] = math.log(1.0 + (len(ranked) - frequency + 0.5) / (frequency + 0.5))
+                if not weights:
+                    continue
+                coverage: dict[str, float] = {}
+                term_coverage: dict[str, dict[str, float]] = {}
+                for chunk in ranked:
+                    title, content = document_texts[chunk.chunk_id]
+                    # A single local passage must support a body-only match. Scattered
+                    # words across a long statute do not jointly satisfy a requirement.
+                    passages = re.split(r"[.。\n]+|[①-⑳]", content)
+                    # An attached proviso qualifies the preceding rule; do not turn
+                    # its exception into an unrelated passage.
+                    joined_passages: list[str] = []
+                    for passage in passages:
+                        if joined_passages and re.match(r"\s*(?:다만|이 경우|단,)", passage):
+                            joined_passages[-1] += " " + passage
+                        else:
+                            joined_passages.append(passage)
+                    passages = joined_passages
+                    title_terms = [term for term in ChunkSearchService.extract_keywords(title)
+                                   if not re.fullmatch(r"제?\d+(?:조|항|호).*", term)
+                                   and term not in tax_labels
+                                   and term not in {"계산", "특례", "범위", "정의", "방법", "규정"}]
+                    title_precision = sum(any(term in token for term in weights) for token in title_terms) / max(len(title_terms), 1)
+                    title_core = any(term in title for term in core_terms)
+                    supported_passages = [passage for passage in passages
+                                          if title_core or sum(term in passage for term in core_terms) >= 2]
+                    if chunk.law_name not in family or not supported_passages:
+                        coverage[chunk.chunk_id] = 0.0
+                        term_coverage[chunk.chunk_id] = {term: 0.0 for term in weights}
+                        continue
+                    # Keep evidence local. Pick one passage, rather than collecting
+                    # unrelated matches from every paragraph in a long article.
+                    passage = max(supported_passages, key=lambda text: sum(
+                        weight for term, weight in weights.items() if term in text
+                    ))
+                    values = {term: weight / sum(weights.values()) * max(
+                        title_precision if term in title else 0.0,
+                        1.0 / 3.0 if term in passage else 0.0,
+                    ) for term, weight in weights.items()}
+                    term_coverage[chunk.chunk_id] = values
+                    coverage[chunk.chunk_id] = sum(values.values())
+                if any(coverage.values()):
+                    requirement_facets.append({"terms": weights, "core_terms": core_terms, "law_names": family})
+                    for chunk in ranked:
+                        facet_scores.setdefault(chunk.chunk_id, []).append(coverage[chunk.chunk_id])
+                        facet_term_scores.setdefault(chunk.chunk_id, []).append(term_coverage[chunk.chunk_id])
+            # Distinct, supported requirements are needed; a law name alone cannot
+            # reserve a slot. The marginal-utility score contract remains unchanged.
+            if len(requirement_facets) > 1:
+                base_scores = {chunk.chunk_id: chunk.score or 0.0 for chunk in ranked}
+                base_mass = sum(base_scores.values())
+                covered = [0.0] * len(requirement_facets)
+                covered_terms = [{term: 0.0 for term in facet["terms"]} for facet in requirement_facets]
+                remaining = list(ranked)
+                selected: list[LawChunk] = []
+                while remaining:
+                    utilities = {
+                        chunk.chunk_id: base_scores[chunk.chunk_id] / base_mass + sum(
+                            max(value - covered_terms[index][term], 0.0)
+                            for index, values in enumerate(facet_term_scores[chunk.chunk_id])
+                            for term, value in values.items()
+                        ) for chunk in remaining
+                    }
+                    best = max(remaining, key=lambda chunk: (utilities[chunk.chunk_id], base_scores[chunk.chunk_id]))
+                    before_coverage = list(covered)
+                    term_gains = [{term: max(value - covered_terms[index][term], 0.0)
+                                   for term, value in values.items()}
+                                  for index, values in enumerate(facet_term_scores[best.chunk_id])]
+                    covered_terms = [{term: max(value, covered_terms[index][term])
+                                      for term, value in values.items()}
+                                     for index, values in enumerate(facet_term_scores[best.chunk_id])]
+                    covered = [sum(values.values()) for values in covered_terms]
+                    best.score = round(utilities[best.chunk_id], 6)
+                    selection_trace.append({
+                        "chunk_id": best.chunk_id, "rank": len(selected) + 1,
+                        "base_score": base_scores[best.chunk_id], "base_prior": base_scores[best.chunk_id] / base_mass,
+                        "facet_coverage": facet_scores[best.chunk_id], "term_gains": term_gains,
+                        "covered_before": before_coverage,
+                        "covered_after": list(covered), "selection_utility": utilities[best.chunk_id],
+                    })
+                    selected.append(best)
+                    remaining.remove(best)
+                ranked = selected
 
         return ranked[:top_k]
 
