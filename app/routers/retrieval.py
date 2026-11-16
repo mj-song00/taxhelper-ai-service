@@ -262,6 +262,7 @@ def build_sources(
         sources.append(
             {
                 "source_type": "law",
+                **({"evidence_units": chunk["evidence_units"]} if "evidence_units" in chunk else {}),
                 "chunk_id": chunk["chunk_id"],
                 "law_name": chunk.get("law_name"),
                 "title": chunk.get("title") or chunk.get("article"),
@@ -368,6 +369,7 @@ class PreparedChat:
     precedent_chunk_data: list[dict]
     law_chunks: list[Any]
     precedent_chunks: list[Any]
+    context_details: dict | None = None
 
 
 async def prepare_chat(
@@ -433,79 +435,90 @@ async def prepare_chat(
             detail="Chunk search service is unavailable.",
         ) from exc
 
+    # 보충 근거까지 조립 전에 예약해 후속 절단을 막는다.
+    limit = min(3000, get_settings().ollama_max_context_chars)
+    nominee_basis = law_service.is_nominee_business_question(request.question)
+    supplement_prefix = f"[보충 법령 근거]\n{NOMINEE_BUSINESS_BASIS}\n\n" if nominee_basis else ""
+    context_details = None
     if precedent_chunks:
-        context_precedent_chunks = precedent_chunks[:2]
-        context_law_chunks = law_chunks[:1]
-        # 판례 질문에서는 판례 근거가 전역 컨텍스트 제한에 잘리지 않도록
-        # 판례를 먼저 배치하되 직접 기준 조문도 함께 제공한다.
-        precedent_context = precedent_service.build_prompt_context(
-            context_precedent_chunks,
-            keywords=precedent_search_conditions["keywords"],
-            max_content_chars=700,
-        )
-        law_context = law_service.build_prompt_context(
-            context_law_chunks,
-            max_content_chars=950,
-            keywords=law_search_conditions["keywords"],
-            keyword_weights=law_search_conditions.get("keyword_weights"),
-        )
-        context = (
-            f"[판례 근거]\n{precedent_context}\n\n"
-            f"[법령 근거]\n{law_context}"
-        ).strip()
+        # 판례 경로는 D 검증 범위 밖이다. 기존 판례 우선/법령 보조 배치를 유지한다.
+        context_precedent_chunks = []
+        context_law_chunks = []
+        precedent_context = "검색된 판례 근거가 없습니다."
+        law_context = "검색된 법령 근거가 없습니다."
+        context = f"{supplement_prefix}[판례 근거]\n{precedent_context}\n\n[법령 근거]\n{law_context}"
+        if len(context) > limit:
+            raise HTTPException(status_code=503, detail="예약 근거가 문자 예산을 초과합니다.")
+        for chunk in precedent_chunks[:2]:
+            trial_chunks = context_precedent_chunks + [chunk]
+            trial_precedent = precedent_service.build_prompt_context(
+                trial_chunks, keywords=precedent_search_conditions["keywords"], max_content_chars=700)
+            trial = f"{supplement_prefix}[판례 근거]\n{trial_precedent}\n\n[법령 근거]\n{law_context}"
+            if len(trial) <= limit:
+                context_precedent_chunks = trial_chunks
+                precedent_context = trial_precedent
+                context = trial
+        if law_chunks:
+            trial_law = law_service.build_prompt_context(
+                law_chunks[:1], max_content_chars=950,
+                keywords=law_search_conditions["keywords"],
+                keyword_weights=law_search_conditions.get("keyword_weights"))
+            trial = f"{supplement_prefix}[판례 근거]\n{precedent_context}\n\n[법령 근거]\n{trial_law}"
+            if len(trial) <= limit:
+                context_law_chunks = law_chunks[:1]
+                law_context = trial_law
+                context = trial
+        context_details = {"input_version": "precedent-legacy-whole-block-budget-v1",
+                           "char_limit": limit, "char_count": len(context),
+                           "precedent_excluded": len(precedent_chunks[:2]) - len(context_precedent_chunks),
+                           "law_excluded": len(law_chunks[:1]) - len(context_law_chunks),
+                           "legal_applicability": "unverified"}
     else:
         context_precedent_chunks = []
-        context_law_chunks = law_chunks
-        context = (
-            "[법령 근거]\n"
-            f"{law_service.build_prompt_context(law_chunks, keywords=law_search_conditions['keywords'], keyword_weights=law_search_conditions.get('keyword_weights'))}\n\n"
-            "[판례 근거]\n검색된 판례 근거가 없습니다."
-        ).strip()
+        try:
+            context_details = law_service.build_prompt_context(
+                law_chunks, question=request.question, search_conditions=law_search_conditions,
+                context_policy="joint-optional-budget-v1", return_details=True,
+                context_prefix=supplement_prefix + "[법령 근거]\n",
+                context_suffix="\n\n[판례 근거]\n검색된 판례 근거가 없습니다.")
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail="검색 근거를 문자 예산 안에 구성하지 못했습니다.") from exc
+        context = context_details["context"]
+        selected_ranks = {block["search_rank"] for block in context_details["blocks"]}
+        context_law_chunks = [chunk for rank, chunk in enumerate(law_chunks, 1) if rank in selected_ranks]
 
-    # 응답에 표시하는 검색 근거와 실제 LLM 프롬프트 근거를 일치시킨다.
-    law_chunk_data = [
-        compact_chunk(
-            chunk,
-            max_content_chars=1000,
+    if not precedent_chunks:
+        # D의 원문 범위·미확인 표시를 응답 근거에서도 유지한다. 표시용 재발췌를 하지 않는다.
+        law_chunk_data = []
+        for rank, chunk in enumerate(law_chunks, 1):
+            units = [{"input_no": number, **block} for number, block in enumerate(context_details["blocks"], 1)
+                     if block["search_rank"] == rank]
+            if not units:
+                continue
+            content = "\n\n".join(
+                ("[완전 단위: 구조 경계 확인·연결/적용 별도]\n" if block["classification"] == "complete_unit"
+                 else "[제한적 인용: 완전 단위 아님·구조미확인·연결/적용 미확인]\n") + block["excerpt"]
+                for block in units)
+            law_chunk_data.append({**chunk.model_dump(mode="json"), "content": content,
+                                   "content_truncated": True, "evidence_units": units})
+    else:
+        law_chunk_data = [compact_chunk(
+            chunk, max_content_chars=1000,
             content_preview=law_service.extract_relevant_excerpt(
-                chunk.content,
-                950,
-                law_search_conditions["keywords"],
-                law_search_conditions.get("keyword_weights"),
-            ),
-        )
-        for chunk in context_law_chunks
-    ]
-    precedent_chunk_data = [
-        compact_chunk(
-            chunk,
-            max_content_chars=1250,
-            content_preview=precedent_service.extract_relevant_excerpt(
-                chunk.content,
-                precedent_search_conditions["keywords"],
-                1200,
-            ),
-        )
-        for chunk in context_precedent_chunks
-    ]
+                chunk.content, 950, law_search_conditions["keywords"], law_search_conditions.get("keyword_weights")))
+            for chunk in context_law_chunks]
+    precedent_chunk_data = [compact_chunk(
+        chunk, max_content_chars=1250,
+        content_preview=precedent_service.extract_relevant_excerpt(
+            chunk.content, precedent_search_conditions["keywords"], 700))
+        for chunk in context_precedent_chunks]
 
-    # The current local law corpus does not contain the National Tax Basic Act.
-    # Supply the controlling provision for nominee-business questions so the
-    # answer and the source shown to the user stay aligned.
-    if law_service.is_nominee_business_question(request.question):
-        context = f"[보충 법령 근거]\n{NOMINEE_BUSINESS_BASIS}\n\n{context}"
-        law_chunk_data.insert(
-            0,
-            {
-                "chunk_id": "curated-national-tax-basic-act-14",
-                "law_name": "국세기본법",
-                "title": "제14조 실질과세",
-                "article": "제14조",
-                "content": NOMINEE_BUSINESS_BASIS,
-                "content_truncated": False,
-                "score": None,
-            },
-        )
+    if nominee_basis:
+        law_chunk_data.insert(0, {"chunk_id": "curated-national-tax-basic-act-14",
+            "law_name": "국세기본법", "title": "제14조 실질과세", "article": "제14조",
+            "content": NOMINEE_BUSINESS_BASIS, "content_truncated": False, "score": None})
+    if len(context) > limit:
+        raise HTTPException(status_code=503, detail="검색 근거가 최종 문자 예산을 초과합니다.")
 
     return PreparedChat(
         context=context,
@@ -513,6 +526,7 @@ async def prepare_chat(
         precedent_chunk_data=precedent_chunk_data,
         law_chunks=law_chunks,
         precedent_chunks=context_precedent_chunks,
+        context_details=context_details,
     )
 
 
