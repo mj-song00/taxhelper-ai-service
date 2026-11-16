@@ -143,8 +143,9 @@ class LlmService:
             and "법인" in compact_question
             and any(term in compact_question for term in ("소득분산", "소득을분산", "부당행위계산"))
         )
-        if len(context) > self.max_context_chars:
-            context = context[:self.max_context_chars]
+        # 조립된 근거·상태 표시는 여기서 자르지 않는다. 초과 입력은 호출 전에 거부한다.
+        if len(context) > min(3000, self.max_context_chars):
+            raise ValueError("검색 근거가 최종 문자 예산을 초과합니다.")
 
         if has_precedent_context:
             source_specific_rules = (
@@ -304,12 +305,16 @@ class LlmService:
             async with self._ollama_semaphore:
                 semaphore_wait_sec = perf_counter() - semaphore_wait_started_at
                 ollama_started_at = perf_counter()
-                print(
-                    f"[OLLAMA_CONCURRENCY] model={self.model} status=started "
-                    f"semaphore_wait_sec={semaphore_wait_sec:.3f} "
-                    f"max_concurrency={self.ollama_max_concurrency}",
-                    flush=True,
-                )
+                try:
+                    print(
+                        f"[OLLAMA_CONCURRENCY] model={self.model} status=started "
+                        f"semaphore_wait_sec={semaphore_wait_sec:.3f} "
+                        f"max_concurrency={self.ollama_max_concurrency}",
+                        flush=True,
+                    )
+                except Exception:
+                    # 계측 실패가 모델 호출 및 기존 예외 처리를 방해하지 않도록 합니다.
+                    pass
                 try:
                     async with self._client.stream("POST", url, json=payload) as response:
                         # Streaming responses are not buffered automatically. Read an error
@@ -331,25 +336,80 @@ class LlmService:
                             if event.get("done") is True:
                                 final_event = event
                 finally:
-                    print(
-                        f"[OLLAMA_CONCURRENCY] model={self.model} status=finished "
-                        f"ollama_elapsed_sec={perf_counter() - ollama_started_at:.3f}",
-                        flush=True,
-                    )
+                    try:
+                        print(
+                            f"[OLLAMA_CONCURRENCY] model={self.model} status=finished "
+                            f"ollama_elapsed_sec={perf_counter() - ollama_started_at:.3f}",
+                            flush=True,
+                        )
+                    except Exception:
+                        # 계측 실패가 모델 호출 및 기존 예외 처리를 방해하지 않도록 합니다.
+                        pass
 
-            total_sec = perf_counter() - ollama_started_at
-            eval_count = int(final_event.get("eval_count") or 0)
-            eval_duration_sec = float(final_event.get("eval_duration") or 0) / 1_000_000_000
-            tokens_per_sec = eval_count / eval_duration_sec if eval_duration_sec > 0 else 0.0
-            print(
-                f"[OLLAMA_TIMING] model={self.model} total_sec={total_sec:.3f} "
-                f"first_token_sec={(first_token_sec or 0.0):.3f} "
-                f"load_sec={float(final_event.get('load_duration') or 0) / 1_000_000_000:.3f} "
-                f"prompt_eval_sec={float(final_event.get('prompt_eval_duration') or 0) / 1_000_000_000:.3f} "
-                f"eval_sec={eval_duration_sec:.3f} prompt_tokens={int(final_event.get('prompt_eval_count') or 0)} "
-                f"output_tokens={eval_count} tokens_per_sec={tokens_per_sec:.2f}",
-                flush=True,
-            )
+            try:
+                # 기존과 동일하게 종료 로그 출력과 세마포어 해제 후 측정합니다.
+                total_sec = perf_counter() - ollama_started_at
+                metric_names = (
+                    "total_duration", "load_duration", "prompt_eval_count",
+                    "prompt_eval_duration", "eval_count", "eval_duration",
+                )
+                metrics = {}
+                missing_metrics = []
+                invalid_metrics = []
+                for name in metric_names:
+                    value = final_event.get(name)
+                    if value is None:
+                        missing_metrics.append(name)
+                        metrics[name] = None
+                    elif type(value) is not int or value < 0:
+                        invalid_metrics.append(name)
+                        metrics[name] = None
+                    else:
+                        metrics[name] = value
+
+                eval_count = metrics["eval_count"]
+                eval_ns = metrics["eval_duration"]
+                tokens_per_sec = (
+                    eval_count * 1_000_000_000 / eval_ns
+                    if eval_count is not None and eval_ns is not None and eval_ns > 0
+                    else None
+                )
+                # 기존 필드명과 단위를 유지하고, 미측정값은 실제 0과 구분합니다.
+                fields = {
+                    "total_sec": total_sec,
+                    "first_token_sec": first_token_sec,
+                    "load_sec": (metrics["load_duration"] / 1_000_000_000
+                                 if metrics["load_duration"] is not None else None),
+                    "prompt_eval_sec": (metrics["prompt_eval_duration"] / 1_000_000_000
+                                        if metrics["prompt_eval_duration"] is not None else None),
+                    "eval_sec": eval_ns / 1_000_000_000 if eval_ns is not None else None,
+                    "prompt_tokens": metrics["prompt_eval_count"],
+                    "output_tokens": eval_count,
+                    "tokens_per_sec": tokens_per_sec,
+                }
+                field_text = " ".join(
+                    f"{name}=" + (
+                        "NA" if value is None else str(value) if type(value) is int
+                        else format(value, ".2f" if name == "tokens_per_sec" else ".3f")
+                    )
+                    for name, value in fields.items()
+                )
+                # 원본 대신 유효한 정수만 기록해 잘못된 응답 내용의 유출을 방지합니다.
+                raw_text = " ".join(
+                    f"{name}_ns=" + ("NA" if metrics[name] is None else str(metrics[name]))
+                    for name in ("total_duration", "prompt_eval_duration",
+                                 "eval_duration", "load_duration")
+                )
+                print(
+                    f"[OLLAMA_TIMING] model={self.model} {field_text} {raw_text} "
+                    f"response_done={str(final_event.get('done') is True).lower()} "
+                    f"missing_metrics={','.join(missing_metrics) or 'none'} "
+                    f"invalid_metrics={','.join(invalid_metrics) or 'none'}",
+                    flush=True,
+                )
+            except Exception:
+                # 계측 계산 및 출력 실패가 기존 답변 반환에 영향을 주지 않도록 합니다.
+                pass
 
         except httpx.ReadTimeout:
             error_logger.exception(
@@ -380,10 +440,12 @@ class LlmService:
                 error_body,
                 exc_info=True,
             )
-            if "exceed_context_size_error" in error_body and not _context_retry:
-                # _build_payload() already caps context at max_context_chars.
-                # Base the retry reduction on that effective size; using the raw
-                # pre-cap length can leave the retry payload almost unchanged.
+            if ("exceed_context_size_error" in error_body and not _context_retry
+                    and not any(marker in context for marker in (
+                        "[법령 근거]", "[판례 근거]", "[보충 법령 근거]",
+                        "[완전 단위:", "[제한적 인용:"))):
+                # 구조화되지 않은 과거 입력에만 기존 축소 재시도를 유지한다.
+                # 조립된 법령·판례·보충 근거는 부분 절단 재시도를 하지 않는다.
                 effective_context_chars = min(len(context), self.max_context_chars)
                 reduced_context = context[
                     : max(1000, int(effective_context_chars * 0.6))
